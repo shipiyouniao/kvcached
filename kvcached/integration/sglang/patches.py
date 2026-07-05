@@ -467,11 +467,11 @@ class ElasticAllocatorPatch(VersionAwarePatch, BasePatch):
                         return
 
                     if self.is_not_in_free_group:
-                        page_ids = torch.unique(free_index // self.page_size)
-                        try:
-                            indices: list[int] = page_ids.cpu().numpy().tolist()
-                        except Exception:
-                            indices = list(page_ids)
+                        free_index_cpu = free_index.detach().to(
+                            device="cpu", non_blocking=False
+                        )
+                        page_ids = torch.unique(free_index_cpu // self.page_size)
+                        indices: list[int] = page_ids.tolist()
                         return self.kvcached_allocator.free(indices)
                     else:
                         self.free_group.append(free_index)
@@ -862,7 +862,7 @@ class ElasticMLAMemoryPoolPatch(VersionAwarePatch, BasePatch):
                             kvcache_shape=(
                                 size + page_size,
                                 1,
-                                self.kv_cache_dim,
+                                cast(int, self.kv_cache_dim),
                             ),
                             dtype=dtype,
                             device=target_device,
