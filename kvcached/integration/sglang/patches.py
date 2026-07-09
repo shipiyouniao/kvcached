@@ -620,6 +620,7 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                         cell_size=self.cell_size,
                         num_layers=layer_num,
                         group_id=self._group_id,
+                        pool_name="mha",
                     )
 
                     k_size, v_size = self.get_kv_size_bytes()
@@ -902,6 +903,7 @@ class ElasticMLAMemoryPoolPatch(VersionAwarePatch, BasePatch):
                         cell_size=self.cell_size,
                         num_layers=layer_num,
                         num_kv_buffers=1,
+                        pool_name="mla",
                     )
 
                     kv_size = self.get_kv_size_bytes()
@@ -1237,6 +1239,7 @@ class ElasticMambaPoolPatch(VersionAwarePatch, BasePatch):
                         reserve_null_block=True,
                         num_kv_buffers=1,
                         group_id=self._group_id,
+                        pool_name="mamba",
                     )
 
                     # Placeholder so code that touches self.free_slots in
