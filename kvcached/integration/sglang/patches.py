@@ -587,6 +587,10 @@ class ElasticMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     # calls _create_buffers() which needs self._group_id.
                     self._group_id = ElasticMHATokenToKVPool._next_group_id
                     ElasticMHATokenToKVPool._next_group_id += 1
+                    # The parent may call _create_buffers() before returning.
+                    # Install the logical dtype as a fallback until it exposes
+                    # the physical storage dtype.
+                    self.store_dtype = dtype
 
                     super().__init__(
                         size=size,
@@ -799,15 +803,23 @@ class ElasticMLAMemoryPoolPatch(VersionAwarePatch, BasePatch):
                         start_layer,
                         end_layer,
                     )
+                    self.store_dtype = getattr(
+                        self, "store_dtype", getattr(self, "dtype", dtype)
+                    )
 
                     # MLA-specific attributes (mirroring MLATokenToKVPool)
                     self.kv_lora_rank = kv_lora_rank
                     self.qk_rope_head_dim = qk_rope_head_dim
                     self.use_nsa = kwargs.get("use_nsa", False)
-                    self.nsa_kv_cache_store_fp8 = (
-                        self.use_nsa and dtype == torch.float8_e4m3fn
-                    )
                     override_kv_cache_dim = kwargs.get("override_kv_cache_dim", None)
+                    self.nsa_kv_cache_store_fp8 = (
+                        self.use_nsa
+                        and override_kv_cache_dim is not None
+                        and (
+                            dtype == torch.float8_e4m3fn
+                            or self.store_dtype == torch.float8_e4m3fn
+                        )
+                    )
                     kv_cache_dim = (
                         override_kv_cache_dim
                         if self.use_nsa and self.nsa_kv_cache_store_fp8
@@ -864,7 +876,7 @@ class ElasticMLAMemoryPoolPatch(VersionAwarePatch, BasePatch):
                                 1,
                                 cast(int, self.kv_cache_dim),
                             ),
-                            dtype=dtype,
+                            dtype=self.store_dtype,
                             device=target_device,
                             num_layers=layer_num,
                             page_size=page_size,
@@ -878,7 +890,9 @@ class ElasticMLAMemoryPoolPatch(VersionAwarePatch, BasePatch):
                         device=self.device,
                     )
 
-                    self.cell_size = (kv_lora_rank + qk_rope_head_dim) * dtype.itemsize
+                    self.cell_size = (
+                        self.kv_cache_dim * self.store_dtype.itemsize
+                    )
                     self.kvcached_allocator = _new_tp_scoped_kvcached_allocator(
                         kvi,
                         tp_rank=tp_rank,
@@ -908,7 +922,7 @@ class ElasticMLAMemoryPoolPatch(VersionAwarePatch, BasePatch):
                     """Return the physical memory limits of the KV buffer."""
                     total_tokens = self.size + self.page_size
                     elems_per_token = self.kv_cache_dim
-                    bytes_per_elem = self.dtype.itemsize
+                    bytes_per_elem = self.store_dtype.itemsize
 
                     return self.layer_num * total_tokens * elems_per_token * bytes_per_elem
 
