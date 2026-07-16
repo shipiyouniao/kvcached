@@ -7,6 +7,7 @@ vLLM-specific patches using unified patch infrastructure.
 
 from __future__ import annotations
 
+import os
 import types
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, Iterable, Optional
@@ -754,14 +755,18 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
                 try:
                     from kvcached.integration.vllm.interfaces import init_kvcached
 
+                    pp_size = int(
+                        vllm_config.parallel_config.pipeline_parallel_size
+                    )
+                    os.environ["KVCACHED_PP_SIZE"] = str(pp_size)
+
                     # IMPORTANT: use tp_size only, NOT tp_size * pp_size.
-                    # The kvcached IPC mechanism coordinates KV tensor readiness
-                    # within a single PP stage's TP group (w0.sock … w(tp-1).sock).
-                    # Each PP stage manages its own KV memory independently, so
-                    # cross-stage IPC is neither needed nor correct.
+                    # A negative pp_rank is the coordinator-side marker for
+                    # broadcasting map/unmap operations to every PP stage.
                     init_kvcached(
                         tp_rank=0,
                         world_size=vllm_config.parallel_config.tensor_parallel_size,
+                        pp_rank=-1 if pp_size > 1 else 0,
                         is_worker=False,
                         async_sched=_should_enable_async_sched(vllm_config),
                     )
@@ -852,14 +857,21 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
             # on startup timing it can either raise or still report world size 1.
             tp_size = int(kvi.get_world_size())
 
-            # Use tp_size (not TP*PP global world size) for the KVCacheManager world_size.
-            # Each PP stage manages its own KV tensors independently. The IPC sockets
-            # are registered per TP rank within each stage (w0.sock … w(tp_size-1).sock).
+            vllm_config = getattr(self, "vllm_config", None)
+            parallel_config = getattr(vllm_config, "parallel_config", None)
+            pp_size = int(
+                getattr(parallel_config, "pipeline_parallel_size", 0)
+                or os.getenv("KVCACHED_PP_SIZE", "1")
+            )
+
+            # Use TP size for each stage, then fan coordinator operations out
+            # across every PP stage's TP-local worker sockets.
             kvi.init_kvcached(
                 tp_rank=0,
                 world_size=tp_size,
+                pp_rank=-1 if pp_size > 1 else 0,
                 is_worker=False,
-                async_sched=_should_enable_async_sched(getattr(self, "vllm_config", None)),
+                async_sched=_should_enable_async_sched(vllm_config),
             )
 
             # Import ElasticBlockPool from the patched module

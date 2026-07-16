@@ -32,6 +32,51 @@ def _get_socket_dir_name() -> str:
 SOCKET_DIR = os.path.join("/tmp", _get_socket_dir_name())
 
 
+def _target_pp_ranks(pp_rank: int) -> range:
+    if pp_rank >= 0:
+        return range(pp_rank, pp_rank + 1)
+
+    pp_size = int(os.getenv("KVCACHED_PP_SIZE", "1"))
+    if pp_size <= 0:
+        raise ValueError(f"KVCACHED_PP_SIZE must be positive, got {pp_size}")
+    return range(pp_size)
+
+
+def _env_falsey(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"0", "false", "no", "off"}
+
+
+def _sync_before_unmap() -> None:
+    """Match PageAllocator's single-process async unmap safety in TP mode."""
+    if _env_falsey("KVCACHED_SYNC_BEFORE_TP_UNMAP"):
+        return
+
+    _sync_cuda(suppress_errors=True)
+
+
+def _sync_after_map() -> None:
+    """Make newly mapped TP pages visible before schedulers touch them."""
+    if _env_falsey("KVCACHED_SYNC_AFTER_TP_MAP"):
+        return
+
+    _sync_cuda(suppress_errors=False)
+
+
+def _sync_cuda(*, suppress_errors: bool) -> None:
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+    except Exception:
+        if not suppress_errors:
+            raise
+        # Unmap will report the real failure if the CUDA context is already
+        # unhealthy.  Do not hide the original unmap response behind sync
+        # bookkeeping.
+        pass
+
+
 def get_worker_socket_path(rank: int, pp_rank: int = 0) -> str:
     """
     Get the path for the worker socket, namespaced by pp_rank.
@@ -122,10 +167,18 @@ def start_worker_listener_thread(rank: int, pp_rank: int = 0):
                 # print(f"Worker {rank} received message: {msg}")
                 group_id: int = msg.get("group_id", 0)
                 if msg["cmd"] == "map_to_kv_tensors":
-                    map_to_kv_tensors(msg["offsets"], group_id=group_id)
+                    if not map_to_kv_tensors(msg["offsets"], group_id=group_id):
+                        raise RuntimeError(
+                            f"Failed to map KV tensors for group_id={group_id}"
+                        )
+                    _sync_after_map()
                     send_msg(conn, {"status": "success"})
                 elif msg["cmd"] == "unmap_from_kv_tensors":
-                    unmap_from_kv_tensors(msg["offsets"], group_id=group_id)
+                    _sync_before_unmap()
+                    if not unmap_from_kv_tensors(msg["offsets"], group_id=group_id):
+                        raise RuntimeError(
+                            f"Failed to unmap KV tensors for group_id={group_id}"
+                        )
                     send_msg(conn, {"status": "success"})
                 elif msg["cmd"] == "kv_tensors_created":
                     created: bool = kv_tensors_created(group_id=group_id)
@@ -179,17 +232,27 @@ async def _broadcast_map_to_kv_tensors(tp_size: int,
     """
     map_message = {"cmd": "map_to_kv_tensors", "offsets": offsets,
                    "group_id": group_id}
+    targets = [
+        (target_pp_rank, rank)
+        for target_pp_rank in _target_pp_ranks(pp_rank)
+        for rank in range(tp_size)
+    ]
     tasks = [
-        _send_and_receive_message(rank, map_message, pp_rank) for rank in range(tp_size)
+        _send_and_receive_message(rank, map_message, target_pp_rank)
+        for target_pp_rank, rank in targets
     ]
 
     responses = await asyncio.gather(*tasks, return_exceptions=True)
-    for rank, response in enumerate(responses):
+    for (target_pp_rank, rank), response in zip(targets, responses):
         if isinstance(response, Exception):
-            raise RuntimeError(f"Worker {rank} failed to map: {response}")
+            raise RuntimeError(
+                f"Worker pp{target_pp_rank}/rank{rank} failed to map: {response}"
+            )
         elif not isinstance(response,
                             dict) or response.get("status") != "success":
-            raise RuntimeError(f"Worker {rank} failed to map: {response}")
+            raise RuntimeError(
+                f"Worker pp{target_pp_rank}/rank{rank} failed to map: {response}"
+            )
 
 
 async def _broadcast_unmap_from_kv_tensors(tp_size: int,
@@ -201,18 +264,27 @@ async def _broadcast_unmap_from_kv_tensors(tp_size: int,
     """
     unmap_message = {"cmd": "unmap_from_kv_tensors", "offsets": offsets,
                      "group_id": group_id}
-    tasks = [
-        _send_and_receive_message(rank, unmap_message, pp_rank)
+    targets = [
+        (target_pp_rank, rank)
+        for target_pp_rank in _target_pp_ranks(pp_rank)
         for rank in range(tp_size)
+    ]
+    tasks = [
+        _send_and_receive_message(rank, unmap_message, target_pp_rank)
+        for target_pp_rank, rank in targets
     ]
 
     responses = await asyncio.gather(*tasks, return_exceptions=True)
-    for rank, response in enumerate(responses):
+    for (target_pp_rank, rank), response in zip(targets, responses):
         if isinstance(response, Exception):
-            raise RuntimeError(f"Worker {rank} failed to unmap: {response}")
+            raise RuntimeError(
+                f"Worker pp{target_pp_rank}/rank{rank} failed to unmap: {response}"
+            )
         elif not isinstance(response,
                             dict) or response.get("status") != "success":
-            raise RuntimeError(f"Worker {rank} failed to unmap: {response}")
+            raise RuntimeError(
+                f"Worker pp{target_pp_rank}/rank{rank} failed to unmap: {response}"
+            )
 
 
 async def _broadcast_kv_tensors_created(tp_size: int,
@@ -223,22 +295,29 @@ async def _broadcast_kv_tensors_created(tp_size: int,
     Returns True if all workers report that KV tensors are created, False otherwise.
     """
     check_message = {"cmd": "kv_tensors_created", "group_id": group_id}
-    tasks = [
-        _send_and_receive_message(rank, check_message, pp_rank)
+    targets = [
+        (target_pp_rank, rank)
+        for target_pp_rank in _target_pp_ranks(pp_rank)
         for rank in range(tp_size)
+    ]
+    tasks = [
+        _send_and_receive_message(rank, check_message, target_pp_rank)
+        for target_pp_rank, rank in targets
     ]
 
     responses = await asyncio.gather(*tasks, return_exceptions=True)
     all_created = True
-    for rank, response in enumerate(responses):
+    for (target_pp_rank, rank), response in zip(targets, responses):
         if isinstance(response, Exception):
             raise RuntimeError(
-                f"Worker {rank} failed to check KV tensors created: {response}"
+                f"Worker pp{target_pp_rank}/rank{rank} failed to check "
+                f"KV tensors created: {response}"
             )
         elif not isinstance(response,
                             dict) or response.get("status") != "success":
             raise RuntimeError(
-                f"Worker {rank} failed to check KV tensors created: {response}"
+                f"Worker pp{target_pp_rank}/rank{rank} failed to check "
+                f"KV tensors created: {response}"
             )
         elif not response.get("created", False):
             all_created = False
