@@ -34,6 +34,10 @@ inline const char *error_string(status_t status) {
 
 inline bool is_success(status_t status) { return status == hipSuccess; }
 
+inline bool is_out_of_memory(status_t status) {
+  return status == hipErrorOutOfMemory;
+}
+
 inline void check(status_t status, const char *tok, const char *file,
                   unsigned line) {
   if (!is_success(status)) {
@@ -47,6 +51,10 @@ inline void check(status_t status, const char *tok, const char *file,
 inline status_t initialize_runtime() { return hipInit(0); }
 
 inline status_t set_device(int dev_idx) { return hipSetDevice(dev_idx); }
+
+inline status_t device_get_pci_bus_id(char *pci_bus_id, int len, int dev_idx) {
+  return hipDeviceGetPCIBusId(pci_bus_id, len, dev_idx);
+}
 
 inline int current_device() {
   int dev_idx = -1;
@@ -145,6 +153,14 @@ inline bool is_success(drv_status_t status) { return status == CUDA_SUCCESS; }
 
 inline bool is_success(rt_status_t status) { return status == cudaSuccess; }
 
+inline bool is_out_of_memory(drv_status_t status) {
+  return status == CUDA_ERROR_OUT_OF_MEMORY;
+}
+
+inline bool is_out_of_memory(rt_status_t status) {
+  return status == cudaErrorMemoryAllocation;
+}
+
 inline void check(drv_status_t status, const char *tok, const char *file,
                   unsigned line) {
   if (!is_success(status)) {
@@ -168,6 +184,11 @@ inline void check(rt_status_t status, const char *tok, const char *file,
 inline rt_status_t initialize_runtime() { return cudaFree(0); }
 
 inline rt_status_t set_device(int dev_idx) { return cudaSetDevice(dev_idx); }
+
+inline rt_status_t device_get_pci_bus_id(char *pci_bus_id, int len,
+                                         int dev_idx) {
+  return cudaDeviceGetPCIBusId(pci_bus_id, len, dev_idx);
+}
 
 inline int current_device() {
   int dev_idx = -1;

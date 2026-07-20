@@ -4,6 +4,9 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 
+#include <stdexcept>
+#include <string>
+
 #include <ATen/ops/from_blob.h>
 #include <c10/core/ScalarType.h>
 
@@ -13,6 +16,20 @@
 #include "page.hpp"
 
 namespace kvcached {
+
+namespace {
+
+template <typename Status>
+void throw_on_gpu_error(Status status, const char *operation) {
+  if (gpu_vmm::is_success(status)) {
+    return;
+  }
+  throw std::runtime_error(std::string(operation) + " failed in " +
+                           gpu_vmm::backend_name() + ": " +
+                           gpu_vmm::error_string(status));
+}
+
+} // namespace
 
 static std::atomic<size_t> g_vaddr_allocated_offset = 0;
 
@@ -109,11 +126,31 @@ bool FTensor::map(offset_t offset) {
   auto vaddr = reinterpret_cast<generic_ptr_t>(
       reinterpret_cast<uintptr_t>(vaddr_) + offset);
   if (dev_.is_cuda()) {
-    CHECK_GPU(gpu_vmm::mem_unmap(vaddr, page_size_));
+    throw_on_gpu_error(gpu_vmm::mem_unmap(vaddr, page_size_),
+                       "zero page unmap");
   }
 
-  mapping_[page_id] = make_unique_page(dev_, page_id, page_size_);
-  mapping_[page_id]->map(vaddr);
+  bool physical_page_mapped = false;
+  try {
+    auto page = make_unique_page(dev_, page_id, page_size_);
+    page->map(vaddr);
+    physical_page_mapped = true;
+    mapping_.emplace(page_id, std::move(page));
+  } catch (...) {
+    if (physical_page_mapped && dev_.is_cuda()) {
+      auto status = gpu_vmm::mem_unmap(vaddr, page_size_);
+      if (!gpu_vmm::is_success(status)) {
+        LOGGER(ERROR, "physical page rollback unmap failed in %s: %s",
+               gpu_vmm::backend_name(), gpu_vmm::error_string(status));
+      }
+    }
+    try {
+      map_(zero_page_.get(), offset);
+    } catch (const std::exception &ex) {
+      LOGGER(ERROR, "zero page restore failed after map error: %s", ex.what());
+    }
+    throw;
+  }
   return true;
 }
 
@@ -129,7 +166,8 @@ bool FTensor::unmap(offset_t offset) {
   auto vaddr = reinterpret_cast<generic_ptr_t>(
       reinterpret_cast<uintptr_t>(vaddr_) + offset);
   if (dev_.is_cuda()) {
-    CHECK_GPU(gpu_vmm::mem_unmap(vaddr, page_size_));
+    throw_on_gpu_error(gpu_vmm::mem_unmap(vaddr, page_size_),
+                       "physical page unmap");
   }
 
   // Map the zero page instead to ensure memory integrity.

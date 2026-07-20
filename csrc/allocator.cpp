@@ -1,9 +1,22 @@
 // SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 // SPDX-License-Identifier: Apache-2.0
 
+#include <cctype>
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
+#include <string>
 #include <unordered_map>
+#include <utility>
+#include <vector>
+
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
 
 #include "allocator.hpp"
 #include "constants.hpp"
@@ -12,6 +25,128 @@
 #include "page.hpp"
 
 namespace kvcached {
+
+namespace {
+
+int resolve_device_index(const c10::Device &device) {
+  return device.index() >= 0 ? device.index() : gpu_vmm::current_device();
+}
+
+double gpu_utilization_limit() {
+  constexpr double kDefaultUtilization = 0.95;
+  const char *value = std::getenv("KVCACHED_GPU_UTILIZATION");
+  if (value == nullptr || *value == '\0') {
+    return kDefaultUtilization;
+  }
+
+  char *end = nullptr;
+  errno = 0;
+  double parsed = std::strtod(value, &end);
+  if (errno != 0 || end == value || *end != '\0' || parsed <= 0.0 ||
+      parsed > 1.0) {
+    throw std::runtime_error(
+        "KVCACHED_GPU_UTILIZATION must be in the range (0, 1]");
+  }
+  return parsed;
+}
+
+std::string physical_gpu_lock_path(int dev_idx) {
+  char pci_bus_id[64] = {};
+  auto status = gpu_vmm::device_get_pci_bus_id(
+      pci_bus_id, static_cast<int>(sizeof(pci_bus_id)), dev_idx);
+  if (!gpu_vmm::is_success(status)) {
+    throw std::runtime_error(std::string("failed to resolve physical GPU: ") +
+                             gpu_vmm::error_string(status));
+  }
+
+  std::string key(pci_bus_id);
+  for (char &value : key) {
+    if (!std::isalnum(static_cast<unsigned char>(value))) {
+      value = '_';
+    }
+  }
+  const char *configured_dir = std::getenv("KVCACHED_PHYSICAL_GROWTH_LOCK_DIR");
+  // Containers sharing a physical GPU must mount the same host directory
+  // here. A container-private /tmp only serializes processes in that container.
+  std::string lock_dir = configured_dir != nullptr && *configured_dir != '\0'
+                             ? configured_dir
+                             : "/tmp";
+  while (lock_dir.size() > 1 && lock_dir.back() == '/') {
+    lock_dir.pop_back();
+  }
+  return lock_dir + "/kvcached-physical-growth-" + key + ".lock";
+}
+
+class PhysicalGrowthGuard {
+public:
+  PhysicalGrowthGuard(int dev_idx, size_t required_bytes) : fd_(-1) {
+    std::string path = physical_gpu_lock_path(dev_idx);
+    fd_ = open(path.c_str(), O_CREAT | O_CLOEXEC | O_RDWR, 0660);
+    if (fd_ < 0) {
+      throw std::runtime_error("failed to open physical GPU growth lock " +
+                               path + ": " + std::strerror(errno));
+    }
+    if (flock(fd_, LOCK_EX) != 0) {
+      int lock_errno = errno;
+      close(fd_);
+      fd_ = -1;
+      throw std::runtime_error("failed to acquire physical GPU growth lock " +
+                               path + ": " + std::strerror(lock_errno));
+    }
+
+    try {
+      auto device_status = gpu_vmm::set_device(dev_idx);
+      if (!gpu_vmm::is_success(device_status)) {
+        throw std::runtime_error(
+            std::string("failed to select physical GPU: ") +
+            gpu_vmm::error_string(device_status));
+      }
+      size_t free_bytes = 0;
+      size_t total_bytes = 0;
+      auto status = gpu_vmm::mem_get_info(&free_bytes, &total_bytes);
+      if (!gpu_vmm::is_success(status)) {
+        throw std::runtime_error(std::string("GPU memory query failed: ") +
+                                 gpu_vmm::error_string(status));
+      }
+      size_t headroom = static_cast<size_t>(static_cast<double>(total_bytes) *
+                                            (1.0 - gpu_utilization_limit()));
+      size_t usable_bytes = free_bytes > headroom ? free_bytes - headroom : 0;
+      if (required_bytes > usable_bytes) {
+        throw std::runtime_error(
+            "capacity_exhausted: physical GPU headroom would be crossed");
+      }
+    } catch (...) {
+      (void)flock(fd_, LOCK_UN);
+      (void)close(fd_);
+      fd_ = -1;
+      throw;
+    }
+  }
+
+  PhysicalGrowthGuard(const PhysicalGrowthGuard &) = delete;
+  PhysicalGrowthGuard &operator=(const PhysicalGrowthGuard &) = delete;
+
+  ~PhysicalGrowthGuard() {
+    if (fd_ >= 0) {
+      (void)flock(fd_, LOCK_UN);
+      (void)close(fd_);
+    }
+  }
+
+private:
+  int fd_;
+};
+
+size_t checked_transaction_bytes(size_t bytes_per_offset, size_t offset_count) {
+  if (offset_count != 0 &&
+      bytes_per_offset > std::numeric_limits<size_t>::max() / offset_count) {
+    throw std::overflow_error("KV mapping transaction size overflow");
+  }
+  return bytes_per_offset * offset_count;
+}
+
+} // namespace
+
 // Global configurable page size
 size_t kPageSize = 2 * 1024 * 1024; // Default 2MB
 
@@ -54,7 +189,8 @@ static inline size_t get_v_base_offset(const at::Tensor &tensor) {
 FTensorAllocator::FTensorAllocator(const c10::Device &device,
                                    bool contiguous_layout)
     : dev_(device), num_layers_(0), contiguous_layout_(contiguous_layout),
-      unified_pool_(false), kv_tensor_size_per_layer_(0) {
+      unified_pool_(false), kv_tensor_size_per_layer_(0),
+      physical_bytes_per_offset_(0) {
   if (dev_.is_cuda()) {
     init_gpu_();
   }
@@ -123,6 +259,11 @@ std::vector<at::Tensor> FTensorAllocator::create_kv_tensors(
     int64_t num_layers, int64_t num_kv_buffers, bool unified_pool) {
   std::lock_guard<std::mutex> lock(mtx_);
 
+  if (num_layers <= 0 || num_kv_buffers <= 0) {
+    throw std::invalid_argument(
+        "num_layers and num_kv_buffers must both be positive");
+  }
+
   assert(num_layers_ == 0 || num_layers_ == num_layers);
   num_layers_ = num_layers;
   unified_pool_ = unified_pool;
@@ -139,7 +280,10 @@ std::vector<at::Tensor> FTensorAllocator::create_kv_tensors(
     // For contiguous layout, we use compound page which groups all layers
     // together for a single page. num_kv_buffers is 2 for MHA (K+V) and
     // 1 for MLA (combined KV).
-    size_t compound_page_size = kPageSize * num_layers * num_kv_buffers;
+    size_t compound_page_size = checked_transaction_bytes(
+        checked_transaction_bytes(kPageSize, static_cast<size_t>(num_layers)),
+        static_cast<size_t>(num_kv_buffers));
+    physical_bytes_per_offset_ = compound_page_size;
     zero_page_ = make_shared_page(dev_, ZERO_PAGE_ID, compound_page_size);
     // We can use the aligned size directly for contiguous layout too because
     // both compound_page_size and aligned_size are already/will be multiplied
@@ -147,6 +291,9 @@ std::vector<at::Tensor> FTensorAllocator::create_kv_tensors(
     return create_kv_tensors_contiguous_(aligned_size, dtype, dev_str,
                                          num_layers, compound_page_size);
   } else {
+    physical_bytes_per_offset_ = checked_transaction_bytes(
+        checked_transaction_bytes(kPageSize, static_cast<size_t>(num_layers)),
+        unified_pool ? 1 : 2);
     zero_page_ = make_shared_page(dev_, ZERO_PAGE_ID);
     return create_kv_tensors_per_layer_(kv_prefix, aligned_size, dtype, dev_str,
                                         num_layers);
@@ -165,45 +312,63 @@ bool FTensorAllocator::map_to_kv_tensors(const std::vector<offset_t> &offsets) {
     return false;
   }
 
-  if (contiguous_layout_) {
-    // In contiguous layout, use the single contiguous tensor for mapping
-    // Each offset maps a block that contains all layers
-    auto ftensor = contiguous_kv_tensor_.get();
-    auto tensor = ftensor->get_tensor();
+  std::unique_ptr<PhysicalGrowthGuard> growth_guard;
+  if (dev_.is_cuda() && !offsets.empty()) {
+    size_t required_bytes =
+        checked_transaction_bytes(physical_bytes_per_offset_, offsets.size());
+    growth_guard = std::make_unique<PhysicalGrowthGuard>(
+        resolve_device_index(dev_), required_bytes);
+  }
 
-    for (auto offset : offsets) {
-      // Map K and V regions for this block (covers all layers)
-      ftensor->map(offset);
+  std::vector<std::pair<FTensor *, offset_t>> mapped;
+  auto map_one = [&mapped](FTensor *ftensor, offset_t offset) {
+    if (!ftensor->map(offset)) {
+      throw std::runtime_error("KV page is already mapped");
     }
-  } else if (unified_pool_) {
-    // Unified pool: K and V share a single block-interleaved FTensor per
-    // layer. Each page id maps exactly one VMM page at pid * page_size.
-    for (int64_t i = 0; i < num_layers_; i++) {
-      auto kv_name = std::string(kv_prefix) + std::to_string(i);
-      auto ftensor = ftensors_[kv_name].get();
+    mapped.emplace_back(ftensor, offset);
+  };
+
+  try {
+    if (contiguous_layout_) {
+      // Each offset maps a compound page containing every layer.
+      auto ftensor = contiguous_kv_tensor_.get();
       for (auto offset : offsets) {
-        ftensor->map(offset);
+        map_one(ftensor, offset);
+      }
+    } else if (unified_pool_) {
+      // K and V share one block-interleaved page per layer.
+      for (int64_t i = 0; i < num_layers_; i++) {
+        auto kv_name = std::string(kv_prefix) + std::to_string(i);
+        auto ftensor = ftensors_[kv_name].get();
+        for (auto offset : offsets) {
+          map_one(ftensor, offset);
+        }
+      }
+    } else {
+      for (int64_t i = 0; i < num_layers_; i++) {
+        auto kv_name = std::string(kv_prefix) + std::to_string(i);
+        auto ftensor = ftensors_[kv_name].get();
+        // K and V are stacked along the first dimension.
+        auto v_base_offset = get_v_base_offset(ftensor->get_tensor());
+        for (auto offset : offsets) {
+          map_one(ftensor, offset);
+          map_one(ftensor, offset + v_base_offset);
+        }
       }
     }
-  } else {
-    // Original per-layer mapping
-    for (int64_t i = 0; i < num_layers_; i++) {
-      auto kv_name = std::string(kv_prefix) + std::to_string(i);
-      auto ftensor = ftensors_[kv_name].get();
-      /**
-       * NOTE: we assume the K tensor and the V tensor are stacked at the 1st
-       * dim. This is used for calculating the offset of the V tensor.
-       * FIXME: (YIFAN) we may support other KV cache layouts later.
-       */
-      auto tensor = ftensor->get_tensor();
-      auto v_base_offset = get_v_base_offset(tensor);
-      for (auto offset : offsets) {
-        auto koffset = offset;
-        auto voffset = offset + v_base_offset;
-        ftensor->map(koffset);
-        ftensor->map(voffset);
+  } catch (...) {
+    for (auto it = mapped.rbegin(); it != mapped.rend(); ++it) {
+      try {
+        if (!it->first->unmap(it->second)) {
+          LOGGER(ERROR, "KV mapping rollback found an unmapped offset: %zu",
+                 static_cast<size_t>(it->second));
+        }
+      } catch (const std::exception &ex) {
+        LOGGER(ERROR, "KV mapping rollback failed at offset %zu: %s",
+               static_cast<size_t>(it->second), ex.what());
       }
     }
+    throw;
   }
   return true;
 }

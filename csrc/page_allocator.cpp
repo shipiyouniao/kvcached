@@ -445,7 +445,7 @@ int64_t PageAllocator::get_avail_physical_pages() const {
 
   size_t headroom = total_phy_mem_size * (1.0 - gpu_utilization_);
   avail_phy_mem_size =
-      std::max(avail_phy_mem_size - headroom, static_cast<size_t>(0));
+      avail_phy_mem_size > headroom ? avail_phy_mem_size - headroom : 0;
 
   // Calculate available pages considering layers and KV buffers
   int64_t avail_phy_pages = avail_phy_mem_size / page_size_;

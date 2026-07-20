@@ -184,12 +184,37 @@ async def _broadcast_map_to_kv_tensors(tp_size: int,
     ]
 
     responses = await asyncio.gather(*tasks, return_exceptions=True)
+    failures = []
     for rank, response in enumerate(responses):
         if isinstance(response, Exception):
-            raise RuntimeError(f"Worker {rank} failed to map: {response}")
+            failures.append(f"worker {rank}: {response}")
         elif not isinstance(response,
                             dict) or response.get("status") != "success":
-            raise RuntimeError(f"Worker {rank} failed to map: {response}")
+            failures.append(f"worker {rank}: {response}")
+
+    if failures:
+        # A worker may have completed the map even when its response was lost.
+        # Roll back every rank best-effort so the TP-wide operation is atomic.
+        unmap_message = {"cmd": "unmap_from_kv_tensors", "offsets": offsets,
+                         "group_id": group_id}
+        rollback_tasks = [
+            _send_and_receive_message(rank, unmap_message, pp_rank)
+            for rank in range(tp_size)
+        ]
+        rollback_responses = await asyncio.gather(
+            *rollback_tasks, return_exceptions=True
+        )
+        rollback_failures = []
+        for rank, response in enumerate(rollback_responses):
+            if isinstance(response, Exception):
+                rollback_failures.append(f"worker {rank}: {response}")
+            elif not isinstance(response, dict) or response.get("status") != "success":
+                rollback_failures.append(f"worker {rank}: {response}")
+
+        message = "Failed to map KV tensors: " + "; ".join(failures)
+        if rollback_failures:
+            message += "; rollback failures: " + "; ".join(rollback_failures)
+        raise RuntimeError(message)
 
 
 async def _broadcast_unmap_from_kv_tensors(tp_size: int,
