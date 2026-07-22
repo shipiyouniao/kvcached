@@ -20,6 +20,14 @@ def _import_kv_cache_manager(monkeypatch):
     vmm_ops.InternalPage = object
     monkeypatch.setitem(sys.modules, "kvcached.vmm_ops", vmm_ops)
 
+    interfaces: Any = types.ModuleType(
+        "kvcached.integration.vllm.interfaces"
+    )
+    interfaces.should_use_worker_ipc = lambda: False
+    monkeypatch.setitem(
+        sys.modules, "kvcached.integration.vllm.interfaces", interfaces
+    )
+
     from kvcached import kv_cache_manager
 
     return kv_cache_manager
