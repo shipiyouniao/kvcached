@@ -92,6 +92,29 @@ def _install_sglang_interfaces(monkeypatch, interfaces):
     )
 
 
+def test_tp_scoped_allocator_forwards_optional_pool_name(monkeypatch):
+    patches = _load_sglang_patches(monkeypatch)
+    calls = []
+
+    def get_manager(**kwargs):
+        calls.append(kwargs)
+        return FakeKVCachedAllocator()
+
+    kvi = types.SimpleNamespace(get_kv_cache_manager=get_manager)
+    patches._new_tp_scoped_kvcached_allocator(
+        kvi,
+        tp_rank=0,
+        tp_size=1,
+        num_blocks=16,
+        block_size=4,
+        cell_size=256,
+        num_layers=2,
+        pool_name="mha",
+    )
+
+    assert calls[0]["pool_name"] == "mha"
+
+
 def test_elastic_paged_alloc_extend_accepts_precomputed_num_new_pages(monkeypatch):
     patches = _load_sglang_patches(monkeypatch)
 

@@ -140,11 +140,12 @@ def _new_tp_scoped_kvcached_allocator(
     reserve_null_block: bool = True,
     num_kv_buffers: int = 2,
     group_id: int = 0,
+    pool_name: Optional[str] = None,
 ) -> Any:
     logical_capacity = max(0, num_blocks - (1 if reserve_null_block else 0))
     if tp_rank != 0 and tp_size > 1:
         return _LogicalKVCachedAllocator(logical_capacity)
-    manager = kvi.get_kv_cache_manager(
+    manager_kwargs: dict[str, Any] = dict(
         num_blocks=num_blocks,
         block_size=block_size,
         cell_size=cell_size,
@@ -153,6 +154,9 @@ def _new_tp_scoped_kvcached_allocator(
         num_kv_buffers=num_kv_buffers,
         group_id=group_id,
     )
+    if pool_name is not None:
+        manager_kwargs["pool_name"] = pool_name
+    manager = kvi.get_kv_cache_manager(**manager_kwargs)
     return _CappedKVCachedAllocator(manager, logical_capacity)
 
 
