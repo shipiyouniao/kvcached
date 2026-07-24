@@ -8,7 +8,7 @@ import sys
 import types
 from pathlib import Path
 
-if importlib.util.find_spec("torch") is None:
+if "torch" not in sys.modules and importlib.util.find_spec("torch") is None:
     sys.modules.setdefault("torch", types.ModuleType("torch"))
 
 from kvcached.observability import (  # noqa: E402
