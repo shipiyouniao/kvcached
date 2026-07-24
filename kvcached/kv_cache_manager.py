@@ -301,7 +301,11 @@ class KVCacheManager:
             self._post_init_done.wait()
 
     def _increment_operation_counter(self, name: str, value: int = 1) -> None:
-        self._operation_counters[name] += value
+        counters = getattr(self, "_operation_counters", None)
+        if counters is None:
+            counters = {}
+            self._operation_counters = counters
+        counters[name] = counters.get(name, 0) + value
 
     def _record_operation_error(self, code: str, counter_name: str) -> None:
         self._increment_operation_counter("operation_errors_total")
@@ -518,7 +522,7 @@ class KVCacheManager:
     @synchronized
     def free(self, indices: List[int]):
         self._increment_operation_counter("free_requests_total")
-        errors_before = self._operation_counters["operation_errors_total"]
+        errors_before = self._operation_counters.get("operation_errors_total", 0)
         try:
             freed_blocks, had_inconsistency = self._free(
                 indices,
@@ -694,9 +698,9 @@ class KVCacheManager:
     @synchronized
     def _get_operation_observability_state(self):
         return (
-            dict(self._operation_counters),
-            self._last_error_code,
-            self._last_error_timestamp_ns,
+            dict(getattr(self, "_operation_counters", {})),
+            getattr(self, "_last_error_code", None),
+            getattr(self, "_last_error_timestamp_ns", None),
         )
 
     @synchronized

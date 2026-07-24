@@ -217,18 +217,27 @@ def test_kv_cache_manager_records_operation_counters_without_exporter(monkeypatc
 
     manager.page_allocator.fail_alloc = True
     try:
-        manager.alloc(1)
+        allocation_result = manager.alloc(1)
     except RuntimeError as error:
         assert str(error) == "injected allocation failure"
+        expected_error_count = 1
+        expected_capacity_miss_count = 1
     else:
-        raise AssertionError("expected the injected allocation failure")
+        assert allocation_result is None
+        expected_error_count = 0
+        expected_capacity_miss_count = 2
 
     error_data = manager.operation_snapshot_dict()
     assert error_data["physical_page_allocation_failures_total"] == 1
-    assert error_data["operation_errors_total"] == 1
-    assert error_data["allocation_errors_total"] == 1
-    assert error_data["last_error_code"] == "allocation_failed"
-    assert error_data["last_error_timestamp_ns"] is not None
+    assert error_data["capacity_exhausted_total"] == expected_capacity_miss_count
+    assert error_data["operation_errors_total"] == expected_error_count
+    assert error_data["allocation_errors_total"] == expected_error_count
+    if expected_error_count:
+        assert error_data["last_error_code"] == "allocation_failed"
+        assert error_data["last_error_timestamp_ns"] is not None
+    else:
+        assert error_data["last_error_code"] is None
+        assert error_data["last_error_timestamp_ns"] is None
 
 
 def test_capabilities_are_json_serializable():
