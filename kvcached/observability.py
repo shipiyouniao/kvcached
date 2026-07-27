@@ -86,6 +86,12 @@ class KVCachePoolSnapshot:
     in_shrink: bool
     shrink_target_blocks: Optional[int]
     resize_target_bytes: Optional[int]
+    physical_limit_bytes: Optional[int]
+    physical_limit_effective_bytes: Optional[int]
+    physical_limit_revision: int
+    physical_limit_remaining_bytes: Optional[int]
+    physical_limit_overage_bytes: int
+    physical_limit_status: str
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -128,6 +134,9 @@ class KVCachePoolOperationSnapshot:
     trim_errors_total: int
     clear_errors_total: int
     state_inconsistency_errors_total: int
+    physical_limit_updates_total: int
+    physical_limit_stale_updates_total: int
+    physical_limit_exhausted_total: int
     last_error_code: Optional[str]
     last_error_timestamp_ns: Optional[int]
 
@@ -206,6 +215,8 @@ def build_kv_cache_pool_snapshot(
     available_blocks = int(manager.available_size())
     allocated_blocks = int(manager._get_num_alloced_blocks())
     reserved_blocks = len(getattr(manager, "reserved_blocks", []))
+    limit_state_fn = getattr(manager, "physical_memory_limit_state", None)
+    limit_state = limit_state_fn() if limit_state_fn is not None else {}
 
     return KVCachePoolSnapshot(
         schema_version=SCHEMA_VERSION,
@@ -237,6 +248,12 @@ def build_kv_cache_pool_snapshot(
         in_shrink=bool(getattr(manager, "in_shrink", False)),
         shrink_target_blocks=getattr(manager, "target_num_blocks", None),
         resize_target_bytes=_call_int(allocator, "get_resize_target"),
+        physical_limit_bytes=limit_state.get("limit_bytes"),
+        physical_limit_effective_bytes=limit_state.get("effective_limit_bytes"),
+        physical_limit_revision=int(limit_state.get("revision", -1)),
+        physical_limit_remaining_bytes=limit_state.get("remaining_bytes"),
+        physical_limit_overage_bytes=int(limit_state.get("overage_bytes", 0)),
+        physical_limit_status=str(limit_state.get("status", "unsupported")),
     )
 
 
@@ -296,6 +313,11 @@ def build_kv_cache_pool_operation_snapshot(
         state_inconsistency_errors_total=counter(
             "state_inconsistency_errors_total"
         ),
+        physical_limit_updates_total=counter("physical_limit_updates_total"),
+        physical_limit_stale_updates_total=counter(
+            "physical_limit_stale_updates_total"
+        ),
+        physical_limit_exhausted_total=counter("physical_limit_exhausted_total"),
         last_error_code=last_error_code,
         last_error_timestamp_ns=last_error_timestamp_ns,
     )
@@ -335,6 +357,23 @@ def clear_registered_kv_cache_pools(*, integration: Optional[str] = None) -> Non
         ]
         for manager_id in stale_ids:
             _registered_pools.pop(manager_id, None)
+
+
+def get_registered_kv_cache_pools(
+    *,
+    integration: Optional[str] = None,
+) -> List[Any]:
+    """Return live registered managers for provider control integrations."""
+    with _registered_pools_lock:
+        entries = list(_registered_pools.values())
+    managers = []
+    for reference, registered_integration in entries:
+        if integration is not None and registered_integration != integration:
+            continue
+        manager = reference()
+        if manager is not None:
+            managers.append(manager)
+    return managers
 
 
 def get_registered_kv_cache_pool_snapshots(
