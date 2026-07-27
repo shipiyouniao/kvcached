@@ -144,6 +144,7 @@ private:
   bool contiguous_layout_;
   bool enable_page_prealloc_;
   double gpu_utilization_;
+  int dev_idx_;
 
   // Memory tracking
   int64_t num_free_pages_;

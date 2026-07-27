@@ -111,7 +111,7 @@ PageAllocator::PageAllocator(int64_t num_layers, int64_t mem_size_per_layer,
       num_kv_buffers_(num_kv_buffers), group_id_(group_id),
       async_sched_(async_sched), contiguous_layout_(contiguous_layout),
       enable_page_prealloc_(enable_page_prealloc),
-      gpu_utilization_(GPU_UTILIZATION),
+      gpu_utilization_(GPU_UTILIZATION), dev_idx_(gpu_vmm::current_device()),
       num_free_pages_(mem_size_per_layer / page_size),
       num_total_pages_(mem_size_per_layer / page_size),
       physical_page_limit_(-1), pending_foreground_pages_(0),
@@ -146,6 +146,7 @@ PageAllocator::PageAllocator(int64_t num_layers, int64_t mem_size_per_layer,
             << "enable_prealloc=" << enable_page_prealloc << ", "
             << "num_kv_buffers=" << num_kv_buffers << ", "
             << "group_id=" << group_id << ", "
+            << "dev_idx=" << dev_idx_ << ", "
             << "min_reserved_pages=" << min_reserved_pages_ << ", "
             << "max_reserved_pages=" << max_reserved_pages_ << std::endl;
 }
@@ -512,6 +513,7 @@ int64_t PageAllocator::get_avail_physical_pages() const {
 }
 
 int64_t PageAllocator::get_avail_unlimited_physical_pages() const {
+  CHECK_GPU(gpu_vmm::set_device(dev_idx_));
   size_t avail_phy_mem_size = 0, total_phy_mem_size = 0;
   CHECK_GPU(gpu_vmm::mem_get_info(&avail_phy_mem_size, &total_phy_mem_size));
 
@@ -700,6 +702,7 @@ void PageAllocator::prealloc_worker() {
 }
 
 void PageAllocator::map_pages(const std::vector<page_id_t> &page_ids) {
+  CHECK_GPU(gpu_vmm::set_device(dev_idx_));
   std::vector<offset_t> offsets;
   offsets.reserve(page_ids.size());
 
@@ -729,6 +732,7 @@ void PageAllocator::map_pages(const std::vector<page_id_t> &page_ids) {
 }
 
 void PageAllocator::unmap_pages(const std::vector<page_id_t> &page_ids) {
+  CHECK_GPU(gpu_vmm::set_device(dev_idx_));
   auto start_time = std::chrono::steady_clock::now();
 
   std::vector<offset_t> offsets;
