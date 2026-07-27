@@ -772,26 +772,21 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
 
         def _patched_engine_init(self, vllm_config, *args: Any, **kwargs: Any):
             if enable_kvcached():
-                try:
-                    from kvcached.integration.vllm.interfaces import init_kvcached
+                from kvcached.integration.vllm.interfaces import init_kvcached
 
-                    pp_size = int(
-                        vllm_config.parallel_config.pipeline_parallel_size
-                    )
-                    os.environ["KVCACHED_PP_SIZE"] = str(pp_size)
+                pp_size = int(vllm_config.parallel_config.pipeline_parallel_size)
+                os.environ["KVCACHED_PP_SIZE"] = str(pp_size)
 
-                    # IMPORTANT: use tp_size only, NOT tp_size * pp_size.
-                    # A negative pp_rank is the coordinator-side marker for
-                    # broadcasting map/unmap operations to every PP stage.
-                    init_kvcached(
-                        tp_rank=0,
-                        world_size=vllm_config.parallel_config.tensor_parallel_size,
-                        pp_rank=-1 if pp_size > 1 else 0,
-                        is_worker=False,
-                        async_sched=_should_enable_async_sched(vllm_config),
-                    )
-                except Exception:
-                    pass
+                # IMPORTANT: use tp_size only, NOT tp_size * pp_size.
+                # A negative pp_rank is the coordinator-side marker for
+                # broadcasting map/unmap operations to every PP stage.
+                init_kvcached(
+                    tp_rank=0,
+                    world_size=vllm_config.parallel_config.tensor_parallel_size,
+                    pp_rank=-1 if pp_size > 1 else 0,
+                    is_worker=False,
+                    async_sched=_should_enable_async_sched(vllm_config),
+                )
             return original_init(self, vllm_config, *args, **kwargs)
 
         self._mark_as_patched(_patched_engine_init, "init")
