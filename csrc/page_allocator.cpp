@@ -105,13 +105,16 @@ PageAllocator::PageAllocator(int64_t num_layers, int64_t mem_size_per_layer,
                              int64_t pp_rank, bool async_sched,
                              bool contiguous_layout, bool enable_page_prealloc,
                              int64_t num_kv_buffers, int64_t group_id,
-                             const std::string &ipc_name)
+                             const std::string &ipc_name,
+                             bool cuda_control_plane)
     : num_layers_(num_layers), mem_size_per_layer_(mem_size_per_layer),
       page_size_(page_size), world_size_(world_size), pp_rank_(pp_rank),
       num_kv_buffers_(num_kv_buffers), group_id_(group_id),
       async_sched_(async_sched), contiguous_layout_(contiguous_layout),
       enable_page_prealloc_(enable_page_prealloc),
-      gpu_utilization_(GPU_UTILIZATION), dev_idx_(gpu_vmm::current_device()),
+      cuda_control_plane_(cuda_control_plane),
+      gpu_utilization_(GPU_UTILIZATION),
+      dev_idx_(cuda_control_plane ? gpu_vmm::current_device() : -1),
       num_free_pages_(mem_size_per_layer / page_size),
       num_total_pages_(mem_size_per_layer / page_size),
       physical_page_limit_(-1), pending_foreground_pages_(0),
@@ -119,7 +122,9 @@ PageAllocator::PageAllocator(int64_t num_layers, int64_t mem_size_per_layer,
       min_reserved_pages_(std::min(num_free_pages_, MIN_RESERVED_PAGES)),
       max_reserved_pages_(std::min(num_free_pages_, MAX_RESERVED_PAGES)),
       prealloc_running_(false), prealloc_needed_(false),
-      total_memory_size_(mem_size_per_layer * num_layers * num_kv_buffers) {
+      total_memory_size_(mem_size_per_layer * num_layers * num_kv_buffers),
+      mem_info_snapshot_valid_(false), mem_info_avail_bytes_(0),
+      mem_info_total_bytes_(0) {
 
   // Initialize free page list
   for (int64_t i = 0; i < num_free_pages_; ++i) {
@@ -513,19 +518,40 @@ int64_t PageAllocator::get_avail_physical_pages() const {
 }
 
 int64_t PageAllocator::get_avail_unlimited_physical_pages() const {
-  CHECK_GPU(gpu_vmm::set_device(dev_idx_));
   size_t avail_phy_mem_size = 0, total_phy_mem_size = 0;
-  CHECK_GPU(gpu_vmm::mem_get_info(&avail_phy_mem_size, &total_phy_mem_size));
+  if (!cuda_control_plane_) {
+    std::lock_guard<std::mutex> guard(mem_info_snapshot_lock_);
+    if (!mem_info_snapshot_valid_) {
+      return 0;
+    }
+    avail_phy_mem_size = mem_info_avail_bytes_;
+    total_phy_mem_size = mem_info_total_bytes_;
+  } else {
+    CHECK_GPU(gpu_vmm::set_device(dev_idx_));
+    CHECK_GPU(gpu_vmm::mem_get_info(&avail_phy_mem_size, &total_phy_mem_size));
+  }
 
   size_t headroom = total_phy_mem_size * (1.0 - gpu_utilization_);
-  avail_phy_mem_size =
-      std::max(avail_phy_mem_size - headroom, static_cast<size_t>(0));
+  avail_phy_mem_size = avail_phy_mem_size > headroom
+                           ? avail_phy_mem_size - headroom
+                           : static_cast<size_t>(0);
 
   // Calculate available pages considering layers and KV buffers
   int64_t avail_phy_pages = avail_phy_mem_size / page_size_;
   int64_t avail_pages_per_layer =
       avail_phy_pages / num_layers_ / num_kv_buffers_;
   return avail_pages_per_layer;
+}
+
+void PageAllocator::update_mem_info_snapshot(size_t avail_bytes,
+                                             size_t total_bytes) {
+  if (avail_bytes > total_bytes) {
+    throw std::invalid_argument("available memory cannot exceed total memory");
+  }
+  std::lock_guard<std::mutex> guard(mem_info_snapshot_lock_);
+  mem_info_avail_bytes_ = avail_bytes;
+  mem_info_total_bytes_ = total_bytes;
+  mem_info_snapshot_valid_ = true;
 }
 
 page_id_t PageAllocator::get_page_id(int64_t block_id,
@@ -702,7 +728,6 @@ void PageAllocator::prealloc_worker() {
 }
 
 void PageAllocator::map_pages(const std::vector<page_id_t> &page_ids) {
-  CHECK_GPU(gpu_vmm::set_device(dev_idx_));
   std::vector<offset_t> offsets;
   offsets.reserve(page_ids.size());
 
@@ -721,6 +746,11 @@ void PageAllocator::map_pages(const std::vector<page_id_t> &page_ids) {
     broadcast_map_callback_(world_size_, offsets);
   } else {
     // Single-process mode: directly call FTensorAllocator
+    if (!cuda_control_plane_) {
+      throw std::runtime_error(
+          "Cannot map pages without CUDA control plane or worker callback");
+    }
+    CHECK_GPU(gpu_vmm::set_device(dev_idx_));
     auto allocator = FTensorAllocator::global_allocator(group_id_);
     bool success = allocator->map_to_kv_tensors(offsets);
     if (!success) {
@@ -732,7 +762,6 @@ void PageAllocator::map_pages(const std::vector<page_id_t> &page_ids) {
 }
 
 void PageAllocator::unmap_pages(const std::vector<page_id_t> &page_ids) {
-  CHECK_GPU(gpu_vmm::set_device(dev_idx_));
   auto start_time = std::chrono::steady_clock::now();
 
   std::vector<offset_t> offsets;
@@ -754,6 +783,11 @@ void PageAllocator::unmap_pages(const std::vector<page_id_t> &page_ids) {
     // callback
     broadcast_unmap_callback_(world_size_, offsets);
   } else {
+    if (!cuda_control_plane_) {
+      throw std::runtime_error(
+          "Cannot unmap pages without CUDA control plane or worker callback");
+    }
+    CHECK_GPU(gpu_vmm::set_device(dev_idx_));
     // Need to synchronize first in async scheduling mode
     if (async_sched_) {
       CHECK_GPU(gpu_vmm::device_synchronize());

@@ -213,6 +213,16 @@ def start_worker_listener_thread(rank: int, pp_rank: int = 0):
                 elif msg["cmd"] == "kv_tensors_created":
                     created: bool = kv_tensors_created(group_id=group_id)
                     send_msg(conn, {"status": "success", "created": created})
+                elif msg["cmd"] == "cuda_mem_get_info":
+                    import torch
+
+                    free_bytes, total_bytes = torch.cuda.mem_get_info()
+                    send_msg(conn, {
+                        "status": "success",
+                        "free_bytes": int(free_bytes),
+                        "total_bytes": int(total_bytes),
+                        "device": int(torch.cuda.current_device()),
+                    })
                 else:
                     send_msg(conn, {
                         "status": "error",
@@ -424,3 +434,18 @@ def broadcast_kv_tensors_created(tp_size: int, pp_rank: int = 0,
                                  group_id: int = 0) -> bool:
     return asyncio.run(_broadcast_kv_tensors_created(tp_size, pp_rank,
                                                      group_id))
+
+
+def query_worker_cuda_mem_get_info(rank: int,
+                                   pp_rank: int = 0,
+                                   timeout: float = 0.1) -> tuple[int, int]:
+    """Query CUDA memory from a worker that owns the target device context."""
+    socket_path = get_worker_socket_path(rank, pp_rank)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout)
+        sock.connect(socket_path)
+        send_msg(sock, {"cmd": "cuda_mem_get_info"})
+        response = recv_msg(sock)
+    if response.get("status") != "success":
+        raise RuntimeError(f"worker cuda_mem_get_info failed: {response}")
+    return int(response["free_bytes"]), int(response["total_bytes"])

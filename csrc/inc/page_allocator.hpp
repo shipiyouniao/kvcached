@@ -60,7 +60,8 @@ public:
                 int64_t page_size, int64_t world_size = 1, int64_t pp_rank = 0,
                 bool async_sched = false, bool contiguous_layout = true,
                 bool enable_page_prealloc = true, int64_t num_kv_buffers = 2,
-                int64_t group_id = 0, const std::string &ipc_name = "");
+                int64_t group_id = 0, const std::string &ipc_name = "",
+                bool cuda_control_plane = true);
 
   ~PageAllocator();
 
@@ -80,6 +81,7 @@ public:
   int64_t get_num_total_pages() const;
   int64_t get_num_reserved_pages() const;
   int64_t get_avail_physical_pages() const;
+  void update_mem_info_snapshot(size_t avail_bytes, size_t total_bytes);
   int64_t get_physical_page_limit() const;
   int64_t get_num_mapped_pages() const;
   int64_t get_num_physical_limit_remaining_pages() const;
@@ -143,6 +145,7 @@ private:
   bool async_sched_;
   bool contiguous_layout_;
   bool enable_page_prealloc_;
+  bool cuda_control_plane_;
   double gpu_utilization_;
   int dev_idx_;
 
@@ -177,6 +180,13 @@ private:
   // Memory info tracker
   int64_t total_memory_size_;
   std::unique_ptr<MemInfoTracker> mem_info_tracker_;
+
+  // Python-owned providers publish plain snapshots here. Native background
+  // threads never call back into Python to refresh them.
+  mutable std::mutex mem_info_snapshot_lock_;
+  bool mem_info_snapshot_valid_;
+  size_t mem_info_avail_bytes_;
+  size_t mem_info_total_bytes_;
 
   // Callback functions for multi-process support
   BroadcastMapCallback broadcast_map_callback_;

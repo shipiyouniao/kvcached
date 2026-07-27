@@ -20,13 +20,9 @@ def _import_kv_cache_manager(monkeypatch):
     vmm_ops.InternalPage = object
     monkeypatch.setitem(sys.modules, "kvcached.vmm_ops", vmm_ops)
 
-    interfaces: Any = types.ModuleType(
-        "kvcached.integration.vllm.interfaces"
-    )
+    interfaces: Any = types.ModuleType("kvcached.integration.vllm.interfaces")
     interfaces.should_use_worker_ipc = lambda: False
-    monkeypatch.setitem(
-        sys.modules, "kvcached.integration.vllm.interfaces", interfaces
-    )
+    monkeypatch.setitem(sys.modules, "kvcached.integration.vllm.interfaces", interfaces)
 
     from kvcached import kv_cache_manager
 
@@ -35,8 +31,7 @@ def _import_kv_cache_manager(monkeypatch):
 
 def test_post_init_timeout_keeps_last_observed_error(monkeypatch):
     kv_cache_manager = _import_kv_cache_manager(monkeypatch)
-    manager = kv_cache_manager.KVCacheManager.__new__(
-        kv_cache_manager.KVCacheManager)
+    manager = kv_cache_manager.KVCacheManager.__new__(kv_cache_manager.KVCacheManager)
     manager.null_block = None
     manager.world_size = 1
     manager.pp_rank = 0
@@ -53,8 +48,7 @@ def test_post_init_timeout_keeps_last_observed_error(monkeypatch):
             raise RuntimeError("kv tensor map failed")
         return False
 
-    monkeypatch.setattr(kv_cache_manager, "kv_tensors_created",
-                        fake_kv_tensors_created)
+    monkeypatch.setattr(kv_cache_manager, "kv_tensors_created", fake_kv_tensors_created)
     monkeypatch.setattr(kv_cache_manager, "KV_TENSOR_WAIT_TIMEOUT", 0.002)
     monkeypatch.setattr(kv_cache_manager.time, "sleep", lambda _: None)
 
@@ -64,9 +58,41 @@ def test_post_init_timeout_keeps_last_observed_error(monkeypatch):
     assert manager._post_init_done.is_set()
 
 
+def test_reserve_null_block_waits_for_transient_capacity(monkeypatch):
+    kv_cache_manager = _import_kv_cache_manager(monkeypatch)
+    manager = kv_cache_manager.KVCacheManager.__new__(kv_cache_manager.KVCacheManager)
+    manager.reserve_null_block = True
+    manager.null_block = None
+
+    available = iter((0, 0, 1))
+    alloc_calls = []
+    manager.available_size = lambda: next(available)
+
+    def fake_alloc(need_size, _skip_wait=False):
+        alloc_calls.append((need_size, _skip_wait))
+        return [0]
+
+    manager._alloc = fake_alloc
+    monkeypatch.setattr(kv_cache_manager.time, "sleep", lambda _: None)
+
+    manager._reserve_null_block()
+
+    assert manager.null_block == [0]
+    assert alloc_calls == [(1, True)]
+
+
 def test_broadcast_callbacks_preserve_runtime_group_context(monkeypatch):
     kv_cache_manager = _import_kv_cache_manager(monkeypatch)
     calls = []
+
+    class FakeThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(kv_cache_manager.threading, "Thread", FakeThread)
 
     class FakePageAllocator:
         def __init__(self, *args, **kwargs):
@@ -86,8 +112,9 @@ def test_broadcast_callbacks_preserve_runtime_group_context(monkeypatch):
             pass
 
     monkeypatch.setattr(kv_cache_manager, "PageAllocator", FakePageAllocator)
-    monkeypatch.setattr(kv_cache_manager, "broadcast_kv_tensors_created",
-                        lambda *args, **kwargs: False)
+    monkeypatch.setattr(
+        kv_cache_manager, "broadcast_kv_tensors_created", lambda *args, **kwargs: False
+    )
     monkeypatch.setattr(kv_cache_manager, "KV_TENSOR_WAIT_TIMEOUT", 0.001)
     monkeypatch.setattr(kv_cache_manager.time, "sleep", lambda _: None)
 
@@ -126,3 +153,81 @@ def test_broadcast_callbacks_preserve_runtime_group_context(monkeypatch):
         ("map", 4, [1, 2, 3], 2, 1007),
         ("unmap", 4, [4, 5], 2, 1007),
     ]
+
+
+def test_enginecore_publishes_worker_meminfo_snapshot_from_python(monkeypatch):
+    kv_cache_manager = _import_kv_cache_manager(monkeypatch)
+    observed: dict[str, Any] = {}
+
+    class FakePageAllocator:
+        def __init__(self, *args, **kwargs):
+            observed["constructor"] = kwargs
+
+        def update_mem_info_snapshot(self, avail_bytes, total_bytes):
+            observed["mem_info_snapshot"] = (avail_bytes, total_bytes)
+
+        def set_should_use_worker_ipc_callback(self, callback):
+            observed["worker_ipc_callback"] = callback
+
+        def set_broadcast_map_callback(self, callback):
+            pass
+
+        def set_broadcast_unmap_callback(self, callback):
+            pass
+
+    monkeypatch.setattr(kv_cache_manager, "PageAllocator", FakePageAllocator)
+    monkeypatch.setattr(kv_cache_manager, "ENGINECORE_NO_CUDA", True)
+    monkeypatch.setattr(kv_cache_manager, "MEMINFO_PROVIDER", "worker")
+
+    class FakeThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(kv_cache_manager.threading, "Thread", FakeThread)
+
+    import kvcached.meminfo_provider as meminfo_provider
+
+    def query_worker(world_size, pp_rank):
+        observed["query"] = (world_size, pp_rank)
+        return 123, 456
+
+    monkeypatch.setattr(meminfo_provider, "query_mem_info", query_worker)
+
+    manager = kv_cache_manager.KVCacheManager(
+        num_blocks=4,
+        block_size=1,
+        cell_size=1,
+        num_layers=1,
+        pp_rank=-1,
+    )
+
+    assert observed["constructor"]["cuda_control_plane"] is False
+    manager._refresh_mem_info_snapshot()
+    assert observed["query"] == (1, -1)
+    assert observed["mem_info_snapshot"] == (123, 456)
+
+
+def test_enginecore_rejects_local_meminfo_without_cuda(monkeypatch):
+    kv_cache_manager = _import_kv_cache_manager(monkeypatch)
+
+    class FakePageAllocator:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(kv_cache_manager, "PageAllocator", FakePageAllocator)
+    monkeypatch.setattr(kv_cache_manager, "ENGINECORE_NO_CUDA", True)
+    monkeypatch.setattr(kv_cache_manager, "MEMINFO_PROVIDER", "local")
+
+    with pytest.raises(
+        kv_cache_manager.KVCachedConfigError,
+        match="requires KVCACHED_MEMINFO_PROVIDER=worker",
+    ):
+        kv_cache_manager.KVCacheManager(
+            num_blocks=4,
+            block_size=1,
+            cell_size=1,
+            num_layers=1,
+        )

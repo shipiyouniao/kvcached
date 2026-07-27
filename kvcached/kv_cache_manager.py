@@ -21,6 +21,9 @@ from kvcached.tp_ipc_util import broadcast_kv_tensors_created
 from kvcached.utils import (
     CONTIGUOUS_LAYOUT,
     DEFAULT_IPC_NAME,
+    ENGINECORE_NO_CUDA,
+    MEMINFO_PROVIDER,
+    MEMINFO_REFRESH_INTERVAL_MS,
     PAGE_PREALLOC_ENABLED,
     PAGE_SIZE,
     SANITY_CHECK,
@@ -31,14 +34,18 @@ from kvcached.vmm_ops import kv_tensors_created
 
 try:
     import kvcached.vmm_ops as kvcached_cpp
+
     PageAllocator = kvcached_cpp.PageAllocator
     InternalPage: Any = kvcached_cpp.InternalPage
 except ImportError as e:
-    raise ImportError(f"Failed to import kvcached.vmm_ops. Please ensure the C++ extension is built properly. err: {e}")
+    raise ImportError(
+        f"Failed to import kvcached.vmm_ops. Please ensure the C++ extension is built properly. err: {e}"
+    )
 
 logger = get_kvcached_logger()
 
 KV_TENSOR_WAIT_TIMEOUT: float = 10.0  # seconds
+NULL_BLOCK_WAIT_TIMEOUT: float = 60.0  # seconds
 PREALLOC_THREAD_TIMEOUT: float = 2.0  # seconds
 
 
@@ -56,7 +63,6 @@ def synchronized(method):
 
 
 class KVCacheManager:
-
     def __init__(
         self,
         num_blocks: int,
@@ -117,11 +123,19 @@ class KVCacheManager:
                 f"with hybrid linear-attention models (e.g. Qwen3.5/3.6 GDN, "
                 f"Mamba) whose per-block state is large. Re-launch with "
                 f"KVCACHED_PAGE_SIZE_MB={min_page_mb} (or larger; must be a "
-                f"multiple of 2).")
+                f"multiple of 2)."
+            )
         # NOTE: this is the memory size of the K or V tensor in one layer
         self.mem_size = self.num_blocks * self.block_mem_size
         self.world_size = world_size
         self.pp_rank = pp_rank
+        if ENGINECORE_NO_CUDA and MEMINFO_PROVIDER != "worker":
+            raise KVCachedConfigError(
+                "KVCACHED_ENGINECORE_NO_CUDA=true requires KVCACHED_MEMINFO_PROVIDER=worker"
+            )
+
+        self._meminfo_refresh_started = False
+        self._meminfo_refresh_stop = threading.Event()
         self.page_allocator = PageAllocator(
             self.num_layers,
             self.mem_size,
@@ -134,12 +148,19 @@ class KVCacheManager:
             num_kv_buffers=self.num_kv_buffers,
             group_id=self.group_id,
             ipc_name=DEFAULT_IPC_NAME,
+            cuda_control_plane=not ENGINECORE_NO_CUDA,
         )
+        if ENGINECORE_NO_CUDA:
+            logger.info(
+                "kvcached EngineCore Python meminfo provider enabled: %s",
+                MEMINFO_PROVIDER,
+            )
         # Register should_use_worker_ipc callback so C++ PageAllocator
         # knows when to use broadcast IPC even with world_size == 1
         # (e.g. vLLM V1 EngineCore + worker in separate processes).
         try:
             from kvcached.integration.vllm.interfaces import should_use_worker_ipc
+
             self.page_allocator.set_should_use_worker_ipc_callback(should_use_worker_ipc)
             use_worker_ipc = should_use_worker_ipc()
         except ImportError:
@@ -155,9 +176,7 @@ class KVCacheManager:
                 # Wrap Python functions to match C++ callback signature
                 def map_callback(world_size: int, offsets: List[int]) -> None:
                     """Wrapper for Python broadcast function."""
-                    broadcast_map_to_kv_tensors(
-                        world_size, offsets, self.pp_rank, self.group_id
-                    )
+                    broadcast_map_to_kv_tensors(world_size, offsets, self.pp_rank, self.group_id)
 
                 def unmap_callback(world_size: int, offsets: List[int]) -> None:
                     """Wrapper for Python broadcast function"""
@@ -169,20 +188,28 @@ class KVCacheManager:
                 self.page_allocator.set_broadcast_map_callback(map_callback)
                 self.page_allocator.set_broadcast_unmap_callback(unmap_callback)
 
-                logger.info("Set up broadcast callbacks for multi-process (world_size=%d, use_worker_ipc=%s)",
-                            self.world_size, use_worker_ipc)
+                logger.info(
+                    "Set up broadcast callbacks for multi-process (world_size=%d, use_worker_ipc=%s)",
+                    self.world_size,
+                    use_worker_ipc,
+                )
             except ImportError as e:
-                logger.warning("Failed to import tp_ipc_util module: %s. Broadcast callbacks will not be available.", e)
+                logger.warning(
+                    "Failed to import tp_ipc_util module: %s. Broadcast callbacks will not be available.",
+                    e,
+                )
             except Exception as e:
-                logger.warning("Failed to set up broadcast callbacks: %s. Falling back to single-process mode.", e)
+                logger.warning(
+                    "Failed to set up broadcast callbacks: %s. Falling back to single-process mode.",
+                    e,
+                )
 
         # In multi-process mode, vLLM reserves its null block from the first
         # post-init alloc() call rather than via reserve_null_block=True.
         # Starting the background prealloc thread before that first alloc can
         # race the same multi-process map path and stall TP startup.
-        self._defer_prealloc_until_first_alloc = (
-            not self.reserve_null_block
-            and (self.world_size > 1 or use_worker_ipc)
+        self._defer_prealloc_until_first_alloc = not self.reserve_null_block and (
+            self.world_size > 1 or use_worker_ipc
         )
         self._prealloc_started = False
 
@@ -248,6 +275,38 @@ class KVCacheManager:
         self.page_allocator.start_prealloc_thread()
         self._prealloc_started = True
 
+    def _refresh_mem_info_snapshot(self) -> None:
+        if not ENGINECORE_NO_CUDA:
+            return
+
+        from kvcached.meminfo_provider import query_mem_info
+
+        avail_bytes, total_bytes = query_mem_info(self.world_size, self.pp_rank)
+        self.page_allocator.update_mem_info_snapshot(avail_bytes, total_bytes)
+
+    def _meminfo_refresh_worker(self) -> None:
+        interval = max(MEMINFO_REFRESH_INTERVAL_MS, 1) / 1000.0
+        last_error: Optional[str] = None
+        while not self._meminfo_refresh_stop.wait(interval):
+            try:
+                self._refresh_mem_info_snapshot()
+                last_error = None
+            except Exception as exc:
+                message = str(exc)
+                log = logger.warning if message != last_error else logger.debug
+                log("Failed to refresh worker memory snapshot: %s", exc)
+                last_error = message
+
+    def _start_meminfo_refresh(self) -> None:
+        if not ENGINECORE_NO_CUDA or self._meminfo_refresh_started:
+            return
+
+        # The initial query runs on the Python post-init thread after worker
+        # IPC is ready. Native allocator threads only consume this snapshot.
+        self._refresh_mem_info_snapshot()
+        self._meminfo_refresh_started = True
+        threading.Thread(target=self._meminfo_refresh_worker, daemon=True).start()
+
     def _post_init(self):
         if self.null_block is not None:
             return
@@ -255,14 +314,15 @@ class KVCacheManager:
         def _check_kv_tensors_created():
             try:
                 from kvcached.integration.vllm.interfaces import should_use_worker_ipc
+
                 vllm_remote = should_use_worker_ipc()
             except ImportError:
                 vllm_remote = False
 
             if self.world_size > 1 or vllm_remote:
                 return broadcast_kv_tensors_created(
-                    self.world_size, self.pp_rank,
-                    group_id=self.group_id)
+                    self.world_size, self.pp_rank, group_id=self.group_id
+                )
             else:
                 return kv_tensors_created(group_id=self.group_id)
 
@@ -276,14 +336,14 @@ class KVCacheManager:
                 except Exception as e:
                     last_error = e
                 if total_wait >= KV_TENSOR_WAIT_TIMEOUT:
-                    message = ("KV tensors not created after "
-                               f"{KV_TENSOR_WAIT_TIMEOUT} seconds")
+                    message = f"KV tensors not created after {KV_TENSOR_WAIT_TIMEOUT} seconds"
                     if last_error is not None:
                         message = f"{message}; last error: {last_error}"
                     raise TimeoutError(message)
                 time.sleep(0.001)  # 1ms
                 total_wait += 0.001
             # KV tensors created now
+            self._start_meminfo_refresh()
             # Possibly reserve the first block as null block for padding tokens
             self._reserve_null_block()
 
@@ -294,8 +354,7 @@ class KVCacheManager:
                 "post_init_failed",
                 "post_init_errors_total",
             )
-            logger.error(
-                f"Error during KVCacheManager post-initialization: {e}")
+            logger.error(f"Error during KVCacheManager post-initialization: {e}")
             # Set the event even on error to unblock waiting threads
             raise
         finally:
@@ -322,22 +381,50 @@ class KVCacheManager:
         """
         Reserve the first block as null block for padding tokens.
         """
-        if self.reserve_null_block:
-            self.null_block = self._alloc(1, _skip_wait=True)
-            if self.null_block != [0]:
-                logger.error(f"Failed to reserve null block, got {self.null_block}")
-                raise RuntimeError("Failed to reserve null block at index 0")
-        else:
+        if not self.reserve_null_block:
             self.null_block = None
+            return
 
+        deadline = time.monotonic() + NULL_BLOCK_WAIT_TIMEOUT
+        waiting_logged = False
+        last_error: Exception | None = None
+        while True:
+            candidate = None
+            try:
+                if self.available_size() >= 1:
+                    candidate = self._alloc(1, _skip_wait=True)
+            except (OSError, TimeoutError) as exc:
+                last_error = exc
+
+            if candidate == [0]:
+                self.null_block = candidate
+                return
+            if candidate is not None:
+                self.null_block = candidate
+                logger.error("Failed to reserve null block, got %s", candidate)
+                raise RuntimeError("Failed to reserve null block at index 0")
+            if time.monotonic() >= deadline:
+                message = (
+                    "Timed out waiting for physical capacity to reserve null "
+                    f"block after {NULL_BLOCK_WAIT_TIMEOUT} seconds"
+                )
+                if last_error is not None:
+                    message = f"{message}; last error: {last_error}"
+                logger.error(message)
+                raise TimeoutError(message)
+            if not waiting_logged:
+                logger.info(
+                    "Waiting for transient startup memory pressure to clear "
+                    "before reserving null block"
+                )
+                waiting_logged = True
+            time.sleep(0.05)
 
     def alloc(self, need_size: int) -> Optional[List[int]]:
         return self._alloc(need_size)
 
     @synchronized
-    def _alloc(self,
-               need_size: int,
-               _skip_wait: bool = False) -> Optional[List[int]]:
+    def _alloc(self, need_size: int, _skip_wait: bool = False) -> Optional[List[int]]:
         track_operation = not _skip_wait
         if track_operation:
             self._increment_operation_counter("allocation_requests_total")
@@ -362,9 +449,7 @@ class KVCacheManager:
             self._increment_operation_counter("allocated_blocks_total", len(indices))
         return indices
 
-    def _alloc_impl(self,
-                    need_size: int,
-                    _skip_wait: bool = False) -> Optional[List[int]]:
+    def _alloc_impl(self, need_size: int, _skip_wait: bool = False) -> Optional[List[int]]:
         if not _skip_wait:
             # Normal callers must wait until background initialisation is
             # finished and then perform the usual capacity check.
@@ -375,8 +460,7 @@ class KVCacheManager:
             self.resize(new_mem_size)
 
         if self.available_size() < need_size:
-            logger.warning(f"available_size()={self.available_size()} < "
-                           f"need_size={need_size}")
+            logger.warning(f"available_size()={self.available_size()} < need_size={need_size}")
             return None
 
         ret_index = []
@@ -397,13 +481,9 @@ class KVCacheManager:
                     page = self.page_allocator.alloc_page()
                     page.init(self.block_mem_size)
                 except RuntimeError as exc:
-                    self._increment_operation_counter(
-                        "physical_page_allocation_failures_total"
-                    )
+                    self._increment_operation_counter("physical_page_allocation_failures_total")
                     if "Physical KV memory limit reached" in str(exc):
-                        self._increment_operation_counter(
-                            "physical_limit_exhausted_total"
-                        )
+                        self._increment_operation_counter("physical_limit_exhausted_total")
                     logger.warning(
                         "Physical KV page allocation failed; returning "
                         "allocation miss instead of crashing scheduler: %s",
@@ -420,9 +500,7 @@ class KVCacheManager:
                             )
                     return None
                 except Exception:
-                    self._increment_operation_counter(
-                        "physical_page_allocation_failures_total"
-                    )
+                    self._increment_operation_counter("physical_page_allocation_failures_total")
                     raise
                 self._increment_operation_counter("physical_page_allocations_total")
                 # A page may have zero usable blocks when block_mem_size is
@@ -465,8 +543,9 @@ class KVCacheManager:
         if SANITY_CHECK:
             for idx in indices:
                 if idx in self.reserved_blocks:
-                    raise ValueError(f"Freed index {idx} is in "
-                                     " reserved_blocks, which is not allowed.")
+                    raise ValueError(
+                        f"Freed index {idx} is in  reserved_blocks, which is not allowed."
+                    )
 
         idx_dict = self.page_allocator.group_indices_by_page(indices, self.block_mem_size)
 
@@ -490,7 +569,8 @@ class KVCacheManager:
                     # This is a serious error - the page should exist
                     raise ValueError(
                         f"Page {page_id} not found in avail_pages or full_pages. "
-                        f"This indicates a serious state inconsistency.")
+                        f"This indicates a serious state inconsistency."
+                    )
                 else:
                     logger.error(
                         f"Page {page_id} not found in avail_pages or full_pages. "
@@ -521,8 +601,7 @@ class KVCacheManager:
         if self.in_shrink:
             assert self.target_num_blocks is not None
             if self._get_num_alloced_blocks() <= self.target_num_blocks:
-                self.page_allocator.resize(self.target_num_blocks *
-                                           self.block_mem_size)
+                self.page_allocator.resize(self.target_num_blocks * self.block_mem_size)
                 self._increment_operation_counter("resize_completions_total")
                 self.in_shrink = False
                 self.target_num_blocks = None
@@ -609,8 +688,7 @@ class KVCacheManager:
         # NOTE: we can support resizing with reserved blocks, but we want to
         # enforce this check for now to ensure correctness.
         self.free_reserved()
-        assert (len(self.reserved_blocks) == 0
-                ), "Reserved blocks must be freed before resizing."
+        assert len(self.reserved_blocks) == 0, "Reserved blocks must be freed before resizing."
         self.in_shrink = True
         self.target_num_blocks = new_mem_size // self.block_mem_size
         return False
@@ -696,8 +774,10 @@ class KVCacheManager:
         effective = None if page_limit < 0 else page_limit * page_bundle_bytes
         mapped = mapped_pages * page_bundle_bytes
         if status is None:
-            status = "unlimited" if effective is None else (
-                "deferred" if mapped > effective else "applied"
+            status = (
+                "unlimited"
+                if effective is None
+                else ("deferred" if mapped > effective else "applied")
             )
         return {
             "status": status,
@@ -749,28 +829,27 @@ class KVCacheManager:
                     limit_available,
                 )
             blocks_from_free_pages = free_pages * InternalPage.get_num_blocks(
-                self.page_size, self.block_mem_size)
+                self.page_size, self.block_mem_size
+            )
         return avail_blocks + blocks_from_free_pages
 
     @synchronized
-    def get_mapped_memory_size(self, unit='bytes') -> float:
+    def get_mapped_memory_size(self, unit="bytes") -> float:
         """Get memory usage in specified unit (bytes, kb, mb, gb)."""
         mapped_pages = getattr(
             self.page_allocator,
             "get_num_mapped_pages",
             self.page_allocator.get_num_inuse_pages,
         )()
-        memory_bytes = (mapped_pages *
-                        self.num_layers * self.page_size *
-                        self.num_kv_buffers)
+        memory_bytes = mapped_pages * self.num_layers * self.page_size * self.num_kv_buffers
 
-        if unit == 'bytes':
+        if unit == "bytes":
             return memory_bytes
-        elif unit == 'kb':
+        elif unit == "kb":
             return memory_bytes / 1024
-        elif unit == 'mb':
+        elif unit == "mb":
             return memory_bytes / (1024**2)
-        elif unit == 'gb':
+        elif unit == "gb":
             return memory_bytes / (1024**3)
         else:
             raise ValueError(f"Unknown unit: {unit}")
@@ -784,6 +863,7 @@ class KVCacheManager:
     def observability_snapshot(self, *, integration=None):
         """Return a read-only snapshot of this KV cache pool."""
         from kvcached.observability import build_kv_cache_pool_snapshot
+
         return build_kv_cache_pool_snapshot(
             self,
             integration=integration,
@@ -800,6 +880,7 @@ class KVCacheManager:
     def operation_snapshot(self, *, integration=None):
         """Return monotonic operation counters for this KV cache pool."""
         from kvcached.observability import build_kv_cache_pool_operation_snapshot
+
         return build_kv_cache_pool_operation_snapshot(
             self,
             integration=integration,
@@ -843,8 +924,7 @@ class KVCacheManager:
         # Stop the prealloc thread first — it runs on the PageAllocator's
         # lock and can grab pages between our trim/reset/reserve steps,
         # causing the null-block reservation to get a non-zero block.
-        self.page_allocator._stop_prealloc_thread(
-            timeout=PREALLOC_THREAD_TIMEOUT)
+        self.page_allocator._stop_prealloc_thread(timeout=PREALLOC_THREAD_TIMEOUT)
         self._prealloc_started = False
 
         # Clear reserved blocks
@@ -890,14 +970,16 @@ class KVCacheManager:
     def _get_num_alloced_blocks(self) -> int:
         # Blocks from fully allocated pages
         blocks_from_full_pages = len(self.full_pages) * InternalPage.get_num_blocks(
-            self.page_size, self.block_mem_size)
+            self.page_size, self.block_mem_size
+        )
         # Blocks from partially allocated pages. num_avail_blocks is the number
         # of free blocks in the partially allocated pages so the number of
         # allocated blocks is the total number of blocks in the partially
         # allocated pages minus the number of free blocks.
-        blocks_from_avail_pages = len(self.avail_pages) * InternalPage.get_num_blocks(
-            self.page_size, self.block_mem_size) - self.num_avail_blocks
+        blocks_from_avail_pages = (
+            len(self.avail_pages) * InternalPage.get_num_blocks(self.page_size, self.block_mem_size)
+            - self.num_avail_blocks
+        )
         # Blocks from reserved blocks
         blocks_from_reserved_blocks = len(self.reserved_blocks)
-        return (blocks_from_full_pages + blocks_from_avail_pages +
-                blocks_from_reserved_blocks)
+        return blocks_from_full_pages + blocks_from_avail_pages + blocks_from_reserved_blocks

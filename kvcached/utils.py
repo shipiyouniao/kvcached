@@ -25,8 +25,7 @@ def _sanitize_segment(segment: str) -> str:
 
 
 def _detect_engine_tag() -> str:
-    """Best-effort detection of the hosting engine for naming.
-    """
+    """Best-effort detection of the hosting engine for naming."""
     if importlib.util.find_spec("vllm") is not None:
         return "vLLM"
     if importlib.util.find_spec("sglang") is not None:
@@ -35,8 +34,7 @@ def _detect_engine_tag() -> str:
 
 
 def _ipc_segment_exists(name: str) -> bool:
-    """Return True if a shared-memory segment/file with this name exists.
-    """
+    """Return True if a shared-memory segment/file with this name exists."""
     try:
         return os.path.exists(os.path.join(SHM_DIR, name))
     except Exception:
@@ -100,16 +98,14 @@ def _get_page_size() -> int:
     try:
         page_size = int(page_size_mb_str) * 1024 * 1024
     except ValueError:
-        raise ValueError(
-            f"Invalid KVCACHED_PAGE_SIZE_MB: {page_size_mb_str}. Must be an integer."
-        )
+        raise ValueError(f"Invalid KVCACHED_PAGE_SIZE_MB: {page_size_mb_str}. Must be an integer.")
 
     # Validate that PAGE_SIZE is a multiple of 2MB
     base_size = 2 * 1024 * 1024  # 2MB
     if page_size <= 0 or page_size % base_size != 0:
         raise ValueError(
-            f"PAGE_SIZE must be a positive multiple of 2MB (2097152 bytes), "
-            f"got: {page_size}")
+            f"PAGE_SIZE must be a positive multiple of 2MB (2097152 bytes), got: {page_size}"
+        )
 
     return page_size
 
@@ -118,12 +114,20 @@ PAGE_SIZE = _get_page_size()
 
 # Configuration constants for KVCacheManager
 GPU_UTILIZATION = float(os.getenv("KVCACHED_GPU_UTILIZATION", "0.95"))
-PAGE_PREALLOC_ENABLED = os.getenv("KVCACHED_PAGE_PREALLOC_ENABLED",
-                                  "true").lower() == "true"
+PAGE_PREALLOC_ENABLED = os.getenv("KVCACHED_PAGE_PREALLOC_ENABLED", "true").lower() == "true"
 MIN_RESERVED_PAGES = int(os.getenv("KVCACHED_MIN_RESERVED_PAGES", "5"))
 MAX_RESERVED_PAGES = int(os.getenv("KVCACHED_MAX_RESERVED_PAGES", "10"))
 MAX_CACHED_BLOCKS = int(os.getenv("KVCACHED_MAX_CACHED_BLOCKS", "1000"))
 SANITY_CHECK = os.getenv("KVCACHED_SANITY_CHECK", "false").lower() == "true"
+ENGINECORE_NO_CUDA = os.getenv("KVCACHED_ENGINECORE_NO_CUDA", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+MEMINFO_PROVIDER = os.getenv("KVCACHED_MEMINFO_PROVIDER", "local")
+MEMINFO_TIMEOUT_MS = int(os.getenv("KVCACHED_MEMINFO_TIMEOUT_MS", "100"))
+MEMINFO_REFRESH_INTERVAL_MS = int(os.getenv("KVCACHED_MEMINFO_REFRESH_INTERVAL_MS", "100"))
 # Maximum number of tokens the cache may hold as evictable (cached) entries.
 # Semantics:
 #   < 0  → unlimited (closest to vanilla vLLM/SGLang prefix-cache behavior;
@@ -151,6 +155,7 @@ def _default_contiguous_layout() -> bool:
         return explicit.lower() == "true"
     try:
         import torch
+
         if getattr(torch.version, "hip", None):
             return False  # ROCm/HIP: non-contiguous is required for correctness
     except Exception:
@@ -228,14 +233,10 @@ def get_kvcached_logger(name: str = "kvcached") -> logging.Logger:
     if not logger.handlers:
         handler = logging.StreamHandler()
 
-        fmt_str = (f"[{name}]"
-                   "[%(levelname)s]"
-                   "[%(asctime)s]"
-                   "[%(filename)s:%(lineno)d] %(message)s")
+        fmt_str = f"[{name}][%(levelname)s][%(asctime)s][%(filename)s:%(lineno)d] %(message)s"
 
         if LOG_USE_COLOR and handler.stream.isatty():
-            formatter: logging.Formatter = ColorFormatter(
-                fmt_str, datefmt="%Y-%m-%d %H:%M:%S")
+            formatter: logging.Formatter = ColorFormatter(fmt_str, datefmt="%Y-%m-%d %H:%M:%S")
         else:
             formatter = logging.Formatter(fmt_str, datefmt="%Y-%m-%d %H:%M:%S")
 

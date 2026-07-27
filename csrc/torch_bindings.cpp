@@ -74,12 +74,12 @@ std::shared_ptr<PageAllocator> create_page_allocator(
     int64_t world_size = 1, int64_t pp_rank = 0, bool async_sched = false,
     bool contiguous_layout = true, bool enable_page_prealloc = true,
     int64_t num_kv_buffers = 2, int64_t group_id = 0,
-    const std::string &ipc_name = "") {
+    const std::string &ipc_name = "", bool cuda_control_plane = true) {
 
   return std::make_shared<PageAllocator>(
       num_layers, mem_size_per_layer, page_size, world_size, pp_rank,
       async_sched, contiguous_layout, enable_page_prealloc, num_kv_buffers,
-      group_id, ipc_name);
+      group_id, ipc_name, cuda_control_plane);
 }
 
 // PageAllocator method bindings
@@ -150,6 +150,12 @@ int64_t page_allocator_get_num_reserved_pages(
 int64_t page_allocator_get_avail_physical_pages(
     std::shared_ptr<PageAllocator> allocator) {
   return allocator->get_avail_physical_pages();
+}
+
+void page_allocator_update_mem_info_snapshot(
+    std::shared_ptr<PageAllocator> allocator, size_t avail_bytes,
+    size_t total_bytes) {
+  allocator->update_mem_info_snapshot(avail_bytes, total_bytes);
 }
 
 int64_t page_allocator_get_physical_page_limit(
@@ -239,7 +245,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("async_sched") = false, py::arg("contiguous_layout") = true,
            py::arg("enable_page_prealloc") = true,
            py::arg("num_kv_buffers") = 2, py::arg("group_id") = 0,
-           py::arg("ipc_name") = "")
+           py::arg("ipc_name") = "", py::arg("cuda_control_plane") = true)
       .def("start_prealloc_thread",
            &kvcached::page_allocator_start_prealloc_thread)
       .def("stop_prealloc_thread",
@@ -260,6 +266,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            &kvcached::page_allocator_get_num_reserved_pages)
       .def("get_avail_physical_pages",
            &kvcached::page_allocator_get_avail_physical_pages)
+      .def("update_mem_info_snapshot",
+           &kvcached::page_allocator_update_mem_info_snapshot)
       .def("get_physical_page_limit",
            &kvcached::page_allocator_get_physical_page_limit)
       .def("get_num_mapped_pages",
