@@ -11,6 +11,8 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include <fcntl.h>
 #include <sys/file.h>
@@ -300,10 +302,16 @@ bool FTensorAllocator::kv_tensors_created() {
 }
 
 bool FTensorAllocator::map_to_kv_tensors(const std::vector<offset_t> &offsets) {
+  return map_to_kv_tensors_with_result(offsets).first;
+}
+
+std::pair<bool, std::vector<offset_t>>
+FTensorAllocator::map_to_kv_tensors_with_result(
+    const std::vector<offset_t> &offsets) {
   std::unique_lock<std::mutex> lock(mtx_);
   if (num_layers_ == 0) {
     LOGGER(ERROR, "try to map to KV tensors when KV tensors are not created");
-    return false;
+    return {false, {}};
   }
 
   std::unique_ptr<PhysicalGrowthGuard> growth_guard;
@@ -314,47 +322,85 @@ bool FTensorAllocator::map_to_kv_tensors(const std::vector<offset_t> &offsets) {
         resolve_device_index(dev_), required_bytes);
   }
 
-  if (contiguous_layout_) {
-    // In contiguous layout, use the single contiguous tensor for mapping
-    // Each offset maps a block that contains all layers
-    auto ftensor = contiguous_kv_tensor_.get();
-    auto tensor = ftensor->get_tensor();
+  using MappingTarget = std::pair<FTensor *, offset_t>;
+  struct MappingGroup {
+    offset_t logical_offset;
+    std::vector<MappingTarget> targets;
+  };
 
-    for (auto offset : offsets) {
-      // Map K and V regions for this block (covers all layers)
-      ftensor->map(offset);
-    }
-  } else if (unified_pool_) {
-    // Unified pool: K and V share a single block-interleaved FTensor per
-    // layer. Each page id maps exactly one VMM page at pid * page_size.
-    for (int64_t i = 0; i < num_layers_; i++) {
-      auto kv_name = std::string(kv_prefix) + std::to_string(i);
-      auto ftensor = ftensors_[kv_name].get();
-      for (auto offset : offsets) {
-        ftensor->map(offset);
+  std::vector<MappingGroup> groups;
+  groups.reserve(offsets.size());
+  for (auto offset : offsets) {
+    MappingGroup group{offset, {}};
+    if (contiguous_layout_) {
+      group.targets.emplace_back(contiguous_kv_tensor_.get(), offset);
+    } else {
+      for (int64_t i = 0; i < num_layers_; i++) {
+        auto kv_name = std::string(kv_prefix) + std::to_string(i);
+        auto ftensor = ftensors_[kv_name].get();
+        group.targets.emplace_back(ftensor, offset);
+        if (!unified_pool_) {
+          auto v_base_offset = get_v_base_offset(ftensor->get_tensor());
+          group.targets.emplace_back(ftensor, offset + v_base_offset);
+        }
       }
     }
-  } else {
-    // Original per-layer mapping
-    for (int64_t i = 0; i < num_layers_; i++) {
-      auto kv_name = std::string(kv_prefix) + std::to_string(i);
-      auto ftensor = ftensors_[kv_name].get();
-      /**
-       * NOTE: we assume the K tensor and the V tensor are stacked at the 1st
-       * dim. This is used for calculating the offset of the V tensor.
-       * FIXME: (YIFAN) we may support other KV cache layouts later.
-       */
-      auto tensor = ftensor->get_tensor();
-      auto v_base_offset = get_v_base_offset(tensor);
-      for (auto offset : offsets) {
-        auto koffset = offset;
-        auto voffset = offset + v_base_offset;
-        ftensor->map(koffset);
-        ftensor->map(voffset);
-      }
-    }
+    groups.push_back(std::move(group));
   }
-  return true;
+
+  std::vector<MappingTarget> mapped;
+  std::vector<offset_t> newly_mapped_offsets;
+  try {
+    for (const auto &group : groups) {
+      size_t existing = 0;
+      for (const auto &[ftensor, offset] : group.targets) {
+        existing += ftensor->is_mapped_(offset) ? 1 : 0;
+      }
+      if (existing == group.targets.size()) {
+        continue;
+      }
+      if (existing != 0) {
+        throw std::runtime_error("state_inconsistency: logical KV offset is "
+                                 "only partially mapped: " +
+                                 std::to_string(group.logical_offset));
+      }
+
+      for (const auto &[ftensor, offset] : group.targets) {
+        if (!ftensor->map(offset)) {
+          throw std::runtime_error("physical page map returned false");
+        }
+        mapped.emplace_back(ftensor, offset);
+      }
+      newly_mapped_offsets.push_back(group.logical_offset);
+    }
+  } catch (const std::exception &error) {
+    std::vector<std::string> rollback_errors;
+    for (auto it = mapped.rbegin(); it != mapped.rend(); ++it) {
+      try {
+        if (!it->first->unmap(it->second)) {
+          rollback_errors.emplace_back("offset " + std::to_string(it->second) +
+                                       " returned false");
+        }
+      } catch (const std::exception &rollback_error) {
+        rollback_errors.emplace_back("offset " + std::to_string(it->second) +
+                                     ": " + rollback_error.what());
+      }
+    }
+    if (!rollback_errors.empty()) {
+      std::string message =
+          std::string("state_inconsistency: KV map failed: ") + error.what() +
+          "; rollback failed: ";
+      for (size_t i = 0; i < rollback_errors.size(); ++i) {
+        if (i != 0) {
+          message += "; ";
+        }
+        message += rollback_errors[i];
+      }
+      throw std::runtime_error(message);
+    }
+    throw;
+  }
+  return {true, std::move(newly_mapped_offsets)};
 }
 
 bool FTensorAllocator::unmap_from_kv_tensors(
@@ -366,41 +412,87 @@ bool FTensorAllocator::unmap_from_kv_tensors(
     return false;
   }
 
-  if (contiguous_layout_) {
-    // In contiguous layout, unmap using the single contiguous tensor
-    auto ftensor = contiguous_kv_tensor_.get();
-    auto tensor = ftensor->get_tensor();
+  using MappingTarget = std::pair<FTensor *, offset_t>;
+  struct MappingGroup {
+    offset_t logical_offset;
+    std::vector<MappingTarget> targets;
+  };
+  struct RetainedMapping {
+    FTensor *ftensor;
+    offset_t offset;
+    std::unique_ptr<Page> page;
+  };
 
-    for (auto offset : offsets) {
-      // Unmap K and V regions for this block (covers all layers)
-      ftensor->unmap(offset);
-    }
-  } else if (unified_pool_) {
-    // Unified pool: single unmap per pid.
-    for (int64_t i = 0; i < num_layers_; i++) {
-      auto kv_name = std::string(kv_prefix) + std::to_string(i);
-      auto ftensor = ftensors_[kv_name].get();
-      for (auto offset : offsets) {
-        ftensor->unmap(offset);
+  std::vector<MappingGroup> groups;
+  groups.reserve(offsets.size());
+  for (auto offset : offsets) {
+    MappingGroup group{offset, {}};
+    if (contiguous_layout_) {
+      group.targets.emplace_back(contiguous_kv_tensor_.get(), offset);
+    } else {
+      for (int64_t i = 0; i < num_layers_; i++) {
+        auto kv_name = std::string(kv_prefix) + std::to_string(i);
+        auto ftensor = ftensors_[kv_name].get();
+        group.targets.emplace_back(ftensor, offset);
+        if (!unified_pool_) {
+          auto v_base_offset = get_v_base_offset(ftensor->get_tensor());
+          group.targets.emplace_back(ftensor, offset + v_base_offset);
+        }
       }
     }
-  } else {
-    // Original per-layer unmapping
-    for (int64_t i = 0; i < num_layers_; i++) {
-      auto kv_name = std::string(kv_prefix) + std::to_string(i);
-      auto ftensor = ftensors_[kv_name].get();
-      /**
-       * NOTE: we assume the K tensor and the V tensor are stacked at the 1st
-       * dim. This is used for calculating the offset of the V tensor.
-       * FIXME: (YIFAN) we may support other KV cache layouts later.
-       */
-      auto tensor = ftensor->get_tensor();
-      auto v_base_offset = get_v_base_offset(tensor);
-      for (auto offset : offsets) {
-        ftensor->unmap(offset);
-        ftensor->unmap(offset + v_base_offset);
+    groups.push_back(std::move(group));
+  }
+
+  std::vector<RetainedMapping> retained;
+  try {
+    for (const auto &group : groups) {
+      size_t existing = 0;
+      for (const auto &[ftensor, offset] : group.targets) {
+        existing += ftensor->is_mapped_(offset) ? 1 : 0;
+      }
+      if (existing == 0) {
+        continue;
+      }
+      if (existing != group.targets.size()) {
+        throw std::runtime_error("state_inconsistency: logical KV offset is "
+                                 "only partially mapped: " +
+                                 std::to_string(group.logical_offset));
+      }
+
+      for (const auto &[ftensor, offset] : group.targets) {
+        std::unique_ptr<Page> page;
+        if (!ftensor->unmap_retain_(offset, page) || !page) {
+          throw std::runtime_error("physical page unmap returned no page");
+        }
+        retained.push_back({ftensor, offset, std::move(page)});
       }
     }
+  } catch (const std::exception &error) {
+    std::vector<std::string> rollback_errors;
+    for (auto it = retained.rbegin(); it != retained.rend(); ++it) {
+      try {
+        if (!it->ftensor->restore_mapping_(it->offset, it->page)) {
+          rollback_errors.emplace_back("offset " + std::to_string(it->offset) +
+                                       " returned false");
+        }
+      } catch (const std::exception &rollback_error) {
+        rollback_errors.emplace_back("offset " + std::to_string(it->offset) +
+                                     ": " + rollback_error.what());
+      }
+    }
+    if (!rollback_errors.empty()) {
+      std::string message =
+          std::string("state_inconsistency: KV unmap failed: ") + error.what() +
+          "; rollback failed: ";
+      for (size_t i = 0; i < rollback_errors.size(); ++i) {
+        if (i != 0) {
+          message += "; ";
+        }
+        message += rollback_errors[i];
+      }
+      throw std::runtime_error(message);
+    }
+    throw;
   }
   return true;
 }

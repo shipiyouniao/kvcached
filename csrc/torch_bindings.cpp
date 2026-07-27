@@ -6,6 +6,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <torch/csrc/utils/pybind.h>
@@ -50,6 +51,14 @@ bool map_to_kv_tensors(const std::vector<offset_t> &offsets,
   py::gil_scoped_release release;
   auto allocator = FTensorAllocator::global_allocator(group_id);
   return allocator->map_to_kv_tensors(offsets);
+}
+
+std::pair<bool, std::vector<offset_t>>
+map_to_kv_tensors_with_result(const std::vector<offset_t> &offsets,
+                              int64_t group_id = 0) {
+  py::gil_scoped_release release;
+  auto allocator = FTensorAllocator::global_allocator(group_id);
+  return allocator->map_to_kv_tensors_with_result(offsets);
 }
 
 bool unmap_from_kv_tensors(const std::vector<offset_t> &offsets,
@@ -148,8 +157,8 @@ int64_t page_allocator_get_physical_page_limit(
   return allocator->get_physical_page_limit();
 }
 
-int64_t page_allocator_get_num_mapped_pages(
-    std::shared_ptr<PageAllocator> allocator) {
+int64_t
+page_allocator_get_num_mapped_pages(std::shared_ptr<PageAllocator> allocator) {
   return allocator->get_num_mapped_pages();
 }
 
@@ -214,6 +223,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "kv_tensors_created", py::arg("group_id") = 0);
   m.def("map_to_kv_tensors", &kvcached::map_to_kv_tensors, "map_to_kv_tensors",
         py::arg("offsets"), py::arg("group_id") = 0);
+  m.def("map_to_kv_tensors_with_result",
+        &kvcached::map_to_kv_tensors_with_result,
+        "map_to_kv_tensors_with_result", py::arg("offsets"),
+        py::arg("group_id") = 0);
   m.def("unmap_from_kv_tensors", &kvcached::unmap_from_kv_tensors,
         "unmap_from_kv_tensors", py::arg("offsets"), py::arg("group_id") = 0);
 

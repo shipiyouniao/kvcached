@@ -9,8 +9,20 @@ import threading
 import uuid
 from typing import Any, Dict, cast
 
+from kvcached import vmm_ops
 from kvcached.utils import DEFAULT_IPC_NAME
-from kvcached.vmm_ops import kv_tensors_created, map_to_kv_tensors, unmap_from_kv_tensors
+
+kv_tensors_created = vmm_ops.kv_tensors_created
+map_to_kv_tensors = vmm_ops.map_to_kv_tensors
+unmap_from_kv_tensors = vmm_ops.unmap_from_kv_tensors
+
+
+def _map_to_kv_tensors_with_result(offsets: list[int], group_id: int) -> tuple[bool, list[int]]:
+    operation = getattr(vmm_ops, "map_to_kv_tensors_with_result", None)
+    if operation is None:
+        return bool(map_to_kv_tensors(offsets, group_id=group_id)), list(offsets)
+    success, newly_mapped = operation(offsets, group_id=group_id)
+    return bool(success), [int(offset) for offset in newly_mapped]
 
 
 def _get_socket_dir_name() -> str:
@@ -167,12 +179,30 @@ def start_worker_listener_thread(rank: int, pp_rank: int = 0):
                 # print(f"Worker {rank} received message: {msg}")
                 group_id: int = msg.get("group_id", 0)
                 if msg["cmd"] == "map_to_kv_tensors":
-                    if not map_to_kv_tensors(msg["offsets"], group_id=group_id):
-                        raise RuntimeError(
-                            f"Failed to map KV tensors for group_id={group_id}"
-                        )
-                    _sync_after_map()
-                    send_msg(conn, {"status": "success"})
+                    success, newly_mapped = _map_to_kv_tensors_with_result(msg["offsets"], group_id)
+                    if not success:
+                        raise RuntimeError(f"Failed to map KV tensors for group_id={group_id}")
+                    try:
+                        _sync_after_map()
+                    except Exception as map_error:
+                        try:
+                            if newly_mapped:
+                                _sync_before_unmap()
+                                if not unmap_from_kv_tensors(newly_mapped, group_id=group_id):
+                                    raise RuntimeError("map rollback unmap returned false")
+                        except Exception as rollback_error:
+                            raise RuntimeError(
+                                "state_inconsistency: map synchronization failed: "
+                                f"{map_error}; rollback failed: {rollback_error}"
+                            ) from map_error
+                        raise
+                    send_msg(
+                        conn,
+                        {
+                            "status": "success",
+                            "newly_mapped_offsets": newly_mapped,
+                        },
+                    )
                 elif msg["cmd"] == "unmap_from_kv_tensors":
                     _sync_before_unmap()
                     if not unmap_from_kv_tensors(msg["offsets"], group_id=group_id):
@@ -243,16 +273,66 @@ async def _broadcast_map_to_kv_tensors(tp_size: int,
     ]
 
     responses = await asyncio.gather(*tasks, return_exceptions=True)
+    failures: list[str] = []
+    unknown_targets: list[str] = []
+    rollback_targets: list[tuple[int, int, list[int]]] = []
     for (target_pp_rank, rank), response in zip(targets, responses):
         if isinstance(response, Exception):
-            raise RuntimeError(
-                f"Worker pp{target_pp_rank}/rank{rank} failed to map: {response}"
+            target = f"pp{target_pp_rank}/rank{rank}"
+            failures.append(f"Worker {target} failed to map: {response}")
+            unknown_targets.append(target)
+        elif not isinstance(response, dict) or response.get("status") != "success":
+            failures.append(f"Worker pp{target_pp_rank}/rank{rank} failed to map: {response}")
+        else:
+            newly_mapped = response.get("newly_mapped_offsets")
+            if newly_mapped is None:
+                newly_mapped = []
+            rollback_targets.append(
+                (
+                    target_pp_rank,
+                    rank,
+                    [int(offset) for offset in newly_mapped],
+                )
             )
-        elif not isinstance(response,
-                            dict) or response.get("status") != "success":
-            raise RuntimeError(
-                f"Worker pp{target_pp_rank}/rank{rank} failed to map: {response}"
+
+    if not failures:
+        return
+
+    rollback_tasks = []
+    rollback_task_targets = []
+    for target_pp_rank, rank, newly_mapped in rollback_targets:
+        if not newly_mapped:
+            continue
+        rollback_task_targets.append((target_pp_rank, rank))
+        rollback_tasks.append(
+            _send_and_receive_message(
+                rank,
+                {
+                    "cmd": "unmap_from_kv_tensors",
+                    "offsets": newly_mapped,
+                    "group_id": group_id,
+                },
+                target_pp_rank,
             )
+        )
+
+    rollback_failures: list[str] = []
+    if rollback_tasks:
+        rollback_responses = await asyncio.gather(*rollback_tasks, return_exceptions=True)
+        for (target_pp_rank, rank), response in zip(rollback_task_targets, rollback_responses):
+            if isinstance(response, Exception):
+                rollback_failures.append(f"pp{target_pp_rank}/rank{rank}: {response}")
+            elif not isinstance(response, dict) or response.get("status") != "success":
+                rollback_failures.append(f"pp{target_pp_rank}/rank{rank}: {response}")
+
+    message = "; ".join(failures)
+    if unknown_targets:
+        message += "; state_consistency_unknown for workers with lost responses: " + ", ".join(
+            unknown_targets
+        )
+    if rollback_failures:
+        message += "; rollback failures: " + "; ".join(rollback_failures)
+    raise RuntimeError(message)
 
 
 async def _broadcast_unmap_from_kv_tensors(tp_size: int,

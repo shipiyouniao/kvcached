@@ -8,6 +8,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <ATen/core/Tensor.h>
@@ -33,6 +34,8 @@ public:
                                             bool unified_pool = false);
   bool kv_tensors_created();
   bool map_to_kv_tensors(const std::vector<offset_t> &offsets);
+  std::pair<bool, std::vector<offset_t>>
+  map_to_kv_tensors_with_result(const std::vector<offset_t> &offsets);
   bool unmap_from_kv_tensors(const std::vector<offset_t> &offsets);
 
   // Global status interfaces.
