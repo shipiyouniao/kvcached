@@ -940,7 +940,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
 
 
 class EngineCorePatch(VersionAwarePatch, BasePatch):
-    """Patch EngineCore.__init__ to initialize kvcached"""
+    """Patch EngineCore initialization and async batch lifetime ordering."""
 
     library = "vllm"
     target_module = "vllm.v1.engine.core"
@@ -952,8 +952,9 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
         if not self.initialize_version_info():
             return False
 
-        # Apply version-specific patches
-        return self.patch_engine_init(engine_mod)
+        init_patched = self.patch_engine_init(engine_mod)
+        lifetime_patched = self.patch_async_batch_lifetime(engine_mod)
+        return init_patched and lifetime_patched
 
     @version_range(VLLM_ALL_RANGE)
     def patch_engine_init(self, engine_mod: types.ModuleType) -> bool:
@@ -987,6 +988,91 @@ class EngineCorePatch(VersionAwarePatch, BasePatch):
 
         self._mark_as_patched(_patched_engine_init, "init")
         EngineCore.__init__ = _patched_engine_init  # type: ignore[assignment]
+        return True
+
+    @version_range(VLLM_ALL_RANGE)
+    def patch_async_batch_lifetime(self, engine_mod: types.ModuleType) -> bool:
+        """Order physical page release after prior async worker batches."""
+        EngineCore = self._get_target_class(engine_mod)
+        if EngineCore is None:
+            return False
+
+        original_step = getattr(EngineCore, "step_with_batch_queue", None)
+        if original_step is None:
+            return True
+        if self._is_already_patched(original_step, "async_batch_lifetime"):
+            self.logger.debug("EngineCore.step_with_batch_queue already patched")
+            return True
+
+        def _get_manager(engine_core: Any) -> Any:
+            scheduler = getattr(engine_core, "scheduler", None)
+            vllm_manager = getattr(scheduler, "kv_cache_manager", None)
+            block_pool = getattr(vllm_manager, "block_pool", None)
+            return getattr(block_pool, "kv_cache_manager", None)
+
+        def _fence_new_retirements(
+            engine_core: Any,
+            marker: int,
+            in_flight_batches: int,
+        ) -> None:
+            last_marker = getattr(
+                engine_core, "_kvcached_last_fenced_release_marker", 0
+            )
+            if marker <= last_marker:
+                return
+            fences = getattr(engine_core, "_kvcached_release_fences", None)
+            if fences is None:
+                fences = engine_core._kvcached_release_fences = []
+            fences.append([marker, in_flight_batches])
+            engine_core._kvcached_last_fenced_release_marker = marker
+
+        def _patched_step_with_batch_queue(self, *args: Any, **kwargs: Any):
+            manager = _get_manager(self)
+            if manager is None:
+                return original_step(self, *args, **kwargs)
+
+            batch_queue = getattr(self, "batch_queue", None)
+            marker_before = manager.capture_physical_release_marker()
+            _fence_new_retirements(
+                self,
+                marker_before,
+                len(batch_queue) if batch_queue is not None else 0,
+            )
+            result = original_step(self, *args, **kwargs)
+
+            completed_batch = (
+                isinstance(result, tuple) and result and result[0] is not None
+            )
+            fences = getattr(self, "_kvcached_release_fences", [])
+            if completed_batch:
+                for fence in fences:
+                    fence[1] -= 1
+
+            marker_after = manager.capture_physical_release_marker()
+            _fence_new_retirements(
+                self,
+                marker_after,
+                len(batch_queue) if batch_queue is not None else 0,
+            )
+
+            if batch_queue is not None and not batch_queue:
+                # No worker batch remains in flight, so pages retired while
+                # processing the final result are safe to release as well.
+                manager.release_retired_pages_through(marker_after)
+                fences.clear()
+            else:
+                release_marker = None
+                while fences and fences[0][1] <= 0:
+                    release_marker = fences.pop(0)[0]
+                if release_marker is not None:
+                    manager.release_retired_pages_through(release_marker)
+
+            return result
+
+        self._mark_as_patched(
+            _patched_step_with_batch_queue, "async_batch_lifetime"
+        )
+        EngineCore.step_with_batch_queue = _patched_step_with_batch_queue
         return True
 
 
