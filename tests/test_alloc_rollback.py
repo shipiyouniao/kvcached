@@ -134,6 +134,13 @@ def make_manager(fail_after: int,
     return manager
 
 
+def enable_operation_counters(manager: KVCacheManager) -> None:
+    manager._operation_lock = threading.RLock()
+    manager._operation_counters = {}
+    manager._last_error_code = None
+    manager._last_error_timestamp_ns = None
+
+
 def test_successful_alloc_unchanged():
     manager = make_manager(fail_after=2)
     assert manager.alloc(6) == [0, 1, 2, 3, 4, 5]
@@ -161,6 +168,28 @@ def test_page_blocks_rolled_back_and_reusable():
     assert manager.alloc(2) == [2, 3]
 
 
+def test_partial_alloc_rollback_is_not_counted_as_public_free():
+    manager = make_manager(fail_after=1)
+    enable_operation_counters(manager)
+
+    # Allocates all four blocks from page 0, then fails to obtain page 1.
+    assert manager.alloc(6) is None
+
+    counters = manager._operation_counters
+    assert counters["allocation_requests_total"] == 1
+    assert counters["allocation_failures_total"] == 1
+    assert counters["capacity_exhausted_total"] == 1
+    assert counters.get("allocated_blocks_total", 0) == 0
+    assert counters.get("free_requests_total", 0) == 0
+    assert counters.get("free_successes_total", 0) == 0
+    assert counters.get("freed_blocks_total", 0) == 0
+    assert counters["physical_page_allocations_total"] == 1
+    assert counters["physical_page_allocation_failures_total"] == 1
+    assert counters.get("physical_page_frees_total", 0) == 0
+    assert manager.num_avail_blocks == BLOCKS_PER_PAGE
+    assert list(manager.avail_pages) == [0]
+
+
 def test_reserved_blocks_restored_on_miss():
     manager = make_manager(fail_after=0, reserved_blocks=[10, 11])
     assert manager.alloc(4) is None
@@ -172,10 +201,11 @@ def test_mixed_reserved_and_page_blocks_restored():
     # Takes 2 reserved + all 4 blocks of page 0, then fails needing a 2nd page.
     assert manager.alloc(8) is None
     assert manager.reserved_blocks == [10, 11]
-    # Page 0 went fully free again, so it was returned to the page allocator.
-    assert manager.page_allocator.freed_pages == [0]
-    assert manager.num_avail_blocks == 0
-    assert manager.avail_pages == {}
+    # Keep the successfully admitted page mapped so the retry does not need
+    # another cross-instance physical-growth transaction.
+    assert manager.page_allocator.freed_pages == []
+    assert manager.num_avail_blocks == BLOCKS_PER_PAGE
+    assert list(manager.avail_pages) == [0]
     assert manager.full_pages == {}
 
 
