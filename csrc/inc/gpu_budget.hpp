@@ -121,6 +121,7 @@ private:
   explicit GpuBudget(const std::string &path, const Sampler &sampler);
   void check_owner() const;
   void reclaim_instances_locked();
+  void retire_dead_pools();
   BudgetSnapshot snapshot_locked(size_t slot) const;
   void return_locked(size_t slot, uint64_t bytes);
   bool reserve_counter(uint64_t &used, const uint64_t &limit, uint64_t bytes);

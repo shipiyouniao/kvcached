@@ -15,8 +15,11 @@ No minimum reservation, priority, reclaim policy or CPU offload is introduced.
 ## Accounting and identity
 
 All participating workers on one GPU must share the same underlying file, not
-merely matching pathnames in separate container mounts. The file uses the PCI bus
-ID and `KVCACHED_PHYSICAL_GROWTH_LOCK_DIR` (default `/tmp`). GPU partitions with
+merely matching pathnames in separate container mounts. In particular, private
+container `/dev/shm` mounts do not coordinate; configure a shared mount when needed.
+The v2 ledger protocol requires all participating workers to restart together;
+mixing v1 and v2 processes would create independent budgets. The file uses the PCI bus
+ID and `KVCACHED_PHYSICAL_GROWTH_LOCK_DIR` (default `/dev/shm`). GPU partitions with
 the same PCI identity are not separate accounting domains in this version.
 Use a consistent `KVCACHED_IPC_NAME` across an instance's workers. Its fallback is
 the existing process-group naming convention. Pool IDs remain separate records;
@@ -53,9 +56,11 @@ cannot be mistaken for already resident memory and added back as extra credit.
 
 A stable sample sets `budget = max(0, charged_bytes + sampled_free_after_safety_margin)`.
 The available credit is `budget - charged_bytes`: recovering external free memory
-therefore restores exactly the sampled capacity. Dead idle owners remain charged
-on both sides of this subtraction; their charges are never refunded or reclaimed
-online. Interrupted mutations still prevent calibration. Negative headroom is
+therefore restores exactly the sampled capacity. Pool registration can retire an idle dead owner after its kernel lease closes.
+Retirement subtracts the charge from both the budget (saturating at zero) and
+accounting, so it never increases available GPU credit. A later coherent sample
+recovers only capacity actually observed free. Live owner leases retain their
+charges and instance limits. Interrupted mutations still prevent calibration. Negative headroom is
 preserved until after addition so releasing pages cannot regrant credit needed
 to restore the safety margin.
 
@@ -130,7 +135,7 @@ leases. Ordinary grants and refunds do not acquire that shared data flock.
 Grants increment the active count before checking the calibration lease, while
 calibration takes the lease before checking that count. This excludes new
 physical work from a successful sample without putting CUDA calls under a lock.
-The CAS layout uses `.lock.budget-cas-v1`; all participants must use one backend.
+The CAS layout uses `.lock.budget-cas-v2`; all participants must use one backend.
 
 ## SGLang prefill failure boundary
 

@@ -7,6 +7,7 @@
 #include <csignal>
 #include <functional>
 #include <iostream>
+#include <poll.h>
 #include <stdexcept>
 #include <string>
 #include <sys/wait.h>
@@ -336,6 +337,165 @@ static void check_capacity_recovery(const std::string &path) {
                "death during sampling and exact remaining-credit bound\n";
 }
 
+static void check_owner_retirement(const std::string &path) {
+  for (bool deficit : {false, true}) {
+    auto keeper = GpuBudget::connect(path, [] { return 6 * page; });
+    const auto slot = keeper->register_pool("survivor", 0);
+    int ready[2], finish[2];
+    assert(pipe(ready) == 0 && pipe(finish) == 0);
+    const auto child = fork();
+    assert(child >= 0);
+    if (!child) {
+      auto owner = GpuBudget::connect(path, [] { return 0; });
+      const auto owned = owner->register_pool("restart", 0);
+      owner->set_instance_limit(owned, 2 * page, 11);
+      auto grant = owner->grant(owned, 2 * page);
+      auto abandoned = grant->take(2 * page);
+      grant->finish();
+      signal_pipe(ready[1]);
+      await_pipe(finish[0]);
+      _exit(0);
+    }
+    await_pipe(ready[0]);
+    // Registration must not retire an idle but still live owner.
+    keeper->register_pool("observer", 1);
+    assert(keeper->snapshot(slot).charged_bytes == 2 * page);
+    if (deficit)
+      assert(keeper->recalibrate([] { return -static_cast<int64_t>(page); }));
+    const auto before = keeper->snapshot(slot);
+    signal_pipe(finish[1]);
+    child_ok(child);
+    const auto restarted = keeper->register_pool("restart", 0);
+    const auto after = keeper->snapshot(restarted);
+    assert(after.charged_bytes == 0 && after.instance_charged_bytes == 0);
+    assert(after.budget_bytes == (deficit ? 0 : 4 * page));
+    const auto available = [](const BudgetSnapshot &s) {
+      return s.budget_bytes > s.charged_bytes ? s.budget_bytes - s.charged_bytes
+                                              : 0;
+    };
+    assert(available(before) == available(after));
+    assert(after.sync_dead_owner_recoveries >= 1);
+    // The last dead owner no longer pins the old instance revision.
+    assert(keeper->set_instance_limit(restarted, 6 * page, 1) == "applied");
+    assert(keeper->recalibrate([] { return 6 * page; }));
+    keeper->grant(restarted, 6 * page)->finish();
+    for (int fd : {ready[0], ready[1], finish[0], finish[1]})
+      close(fd);
+  }
+  {
+    auto budget = GpuBudget::connect(path, [] { return 8 * page; });
+    const auto slot = budget->register_pool("deferred-refund", 0);
+    auto grant = budget->grant(slot, 4 * page);
+    auto receipt = grant->take(4 * page);
+    grant->finish();
+    BudgetMutation mutation(budget);
+    receipt->release(); // physical free precedes the deferred ledger refund
+    assert(budget->snapshot(slot).charged_bytes == 4 * page);
+    assert(!budget->recalibrate([] { return 8 * page; }));
+    mutation.finish();
+    assert(budget->recalibrate([] { return 8 * page; }));
+    assert(budget->snapshot(slot).budget_bytes == 8 * page);
+  }
+  std::cout << "PASS owner retirement: live lease, dead idle owner, deficit, "
+               "deferred refund\n";
+}
+
+#ifdef KVCACHED_BUDGET_CAS_ACCOUNTING
+static void check_retirement_snapshot(const std::string &path) {
+  auto keeper = GpuBudget::connect(path, [] { return 6 * page; });
+  const auto slot = keeper->register_pool("reader", 0);
+  const auto dead = fork();
+  assert(dead >= 0);
+  if (!dead) {
+    auto owner = GpuBudget::connect(path, [] { return 0; });
+    auto grant =
+        owner->grant(owner->register_pool("dead-reader-peer", 0), 2 * page);
+    auto receipt = grant->take(2 * page);
+    grant->finish();
+    _exit(0);
+  }
+  child_ok(dead);
+  static int reading[2], resume[2];
+  int entered[2], completed[2];
+  assert(pipe(reading) == 0 && pipe(resume) == 0 && pipe(entered) == 0 &&
+         pipe(completed) == 0);
+  keeper->set_accounting_test_hook([](int stage) {
+    if (stage == 50) {
+      signal_pipe(reading[1]);
+      await_pipe(resume[0]);
+    }
+  });
+  auto reaper = GpuBudget::connect(path, [] { return 0; });
+  BudgetSnapshot observed;
+  std::thread reader([&] { observed = keeper->snapshot(slot); });
+  await_pipe(reading[0]);
+  // The connection already exists; only registration/retirement is pending.
+  std::thread retiring([&] {
+    signal_pipe(entered[1]);
+    reaper->register_pool("reaper", 0);
+    signal_pipe(completed[1]);
+  });
+  await_pipe(entered[0]);
+  struct pollfd completion{completed[0], POLLIN, 0};
+  assert(poll(&completion, 1, 100) == 0);
+  signal_pipe(resume[1]);
+  reader.join();
+  retiring.join();
+  keeper->set_accounting_test_hook({});
+  assert(observed.budget_bytes == 6 * page &&
+         observed.charged_bytes == 2 * page);
+  const auto after = keeper->snapshot(slot);
+  assert(after.budget_bytes == 4 * page && after.charged_bytes == 0);
+  for (int fd : {reading[0], reading[1], resume[0], resume[1], entered[0],
+                 entered[1], completed[0], completed[1]})
+    close(fd);
+  std::cout << "PASS CAS retirement: public snapshot excludes control-plane "
+               "mutation\n";
+}
+#endif
+
+static void check_retirement_crash(const std::string &path) {
+  for (int stage : {60, 61, 62}) {
+    auto keeper = GpuBudget::connect(path, [] { return 6 * page; });
+    const auto slot = keeper->register_pool("retirement-survivor", 0);
+    auto child = fork();
+    assert(child >= 0);
+    if (!child) {
+      auto owner = GpuBudget::connect(path, [] { return 0; });
+      auto grant =
+          owner->grant(owner->register_pool("dead-retirement", 0), 2 * page);
+      auto abandoned = grant->take(2 * page);
+      grant->finish();
+      _exit(0);
+    }
+    child_ok(child);
+    child = fork();
+    assert(child >= 0);
+    if (!child) {
+      auto reaper = GpuBudget::connect(path, [] { return 0; });
+      static int crash_stage;
+      crash_stage = stage;
+      reaper->set_accounting_test_hook([](int current) {
+        if (crash_stage == current)
+          _exit(0);
+      });
+      reaper->register_pool("interrupted-retirement", 0);
+      _exit(2);
+    }
+    child_ok(child);
+    const auto after = keeper->snapshot(slot);
+    assert(after.budget_bytes == 4 * page);
+    assert(after.charged_bytes <= 2 * page);
+    assert(after.budget_bytes - after.charged_bytes <= 4 * page);
+    assert(after.active_mutations > 0);
+    assert(!keeper->recalibrate([] { return 6 * page; }));
+    keeper->register_pool("later-registration", 0);
+    rejected([&] { keeper->grant(slot, 5 * page); });
+  }
+  std::cout << "PASS retirement crash: all publication stages retain "
+               "conservative credit\n";
+}
+
 int main() {
   const char *temp = std::getenv("TMPDIR");
   std::string dir =
@@ -549,9 +709,12 @@ int main() {
       << "PASS calibration: headroom deficit survives release and retry\n";
   check_interrupted_initialization(path);
   check_capacity_recovery(path);
+  check_owner_retirement(path);
+  check_retirement_crash(path);
   check_calibration_wait(path);
 
 #ifdef KVCACHED_BUDGET_CAS_ACCOUNTING
+  check_retirement_snapshot(path);
   check_cas_interruption(path);
   check_cas_calibration_race(path);
 #endif
